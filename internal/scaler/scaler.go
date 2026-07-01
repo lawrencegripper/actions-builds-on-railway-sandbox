@@ -28,6 +28,29 @@ type JitGenerator interface {
 	GenerateJitRunnerConfig(ctx context.Context, setting *scaleset.RunnerScaleSetJitRunnerSetting, scaleSetID int) (*scaleset.RunnerScaleSetJitRunnerConfig, error)
 }
 
+// Counts is a point-in-time view of the runner pool.
+type Counts struct {
+	Provisioning int
+	Idle         int
+	Busy         int
+}
+
+func (c Counts) Total() int { return c.Provisioning + c.Idle + c.Busy }
+
+// EventSink observes job lifecycle for reporting (e.g. the dashboard store). All
+// methods must tolerate being called concurrently and should not block; the
+// scaler runs them inline on the listener/runner paths. A nil sink is replaced
+// with a no-op so the scaler works without one.
+type EventSink interface {
+	JobStarted(runnerName string)
+	JobCompleted(runnerName, result string)
+}
+
+type nopSink struct{}
+
+func (nopSink) JobStarted(string)           {}
+func (nopSink) JobCompleted(string, string) {}
+
 // Config configures the Scaler.
 type Config struct {
 	ScaleSetID int
@@ -45,6 +68,8 @@ type Config struct {
 	Provisioner  Provisioner
 	JitGenerator JitGenerator
 	Logger       *slog.Logger
+	// Sink observes job lifecycle events; optional (defaults to a no-op).
+	Sink EventSink
 }
 
 type Scaler struct {
@@ -67,6 +92,9 @@ func New(cfg Config) *Scaler {
 	}
 	if cfg.StartCommand == "" {
 		cfg.StartCommand = "/usr/local/bin/start-runner"
+	}
+	if cfg.Sink == nil {
+		cfg.Sink = nopSink{}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Scaler{
@@ -172,11 +200,13 @@ func (s *Scaler) finish(name, sandboxID string) {
 func (s *Scaler) HandleJobStarted(ctx context.Context, jobInfo *scaleset.JobStarted) error {
 	s.log.Info("job started", slog.String("runner", jobInfo.RunnerName), slog.String("jobId", jobInfo.JobID))
 	s.runner.markBusy(jobInfo.RunnerName)
+	s.cfg.Sink.JobStarted(jobInfo.RunnerName)
 	return nil
 }
 
 func (s *Scaler) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCompleted) error {
 	s.log.Info("job completed", slog.String("runner", jobInfo.RunnerName), slog.String("result", jobInfo.Result))
+	s.cfg.Sink.JobCompleted(jobInfo.RunnerName, jobInfo.Result)
 	sandboxID, ok := s.runner.remove(jobInfo.RunnerName)
 	if !ok {
 		s.log.Warn("job completed for unknown runner", slog.String("runner", jobInfo.RunnerName))
@@ -224,6 +254,22 @@ func (r *runnerState) count() int {
 	defer r.mu.Unlock()
 	return len(r.provisioning) + len(r.idle) + len(r.busy)
 }
+
+// Snapshot returns the current runner counts by phase.
+func (s *Scaler) Snapshot() Counts {
+	r := s.runner
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return Counts{
+		Provisioning: len(r.provisioning),
+		Idle:         len(r.idle),
+		Busy:         len(r.busy),
+	}
+}
+
+// MinRunners and MaxRunners expose the configured bounds for reporting.
+func (s *Scaler) MinRunners() int { return s.cfg.MinRunners }
+func (s *Scaler) MaxRunners() int { return s.cfg.MaxRunners }
 
 func (r *runnerState) reserve(name string) bool {
 	r.mu.Lock()

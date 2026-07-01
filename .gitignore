@@ -5,3 +5,9 @@ rsa
 .env.*
 !.env.example
 .DS_Store
+
+# IaC dep dir (bun install); bun.lock is committed
+node_modules
+
+# local dashboard SQLite (dev fallback when no Railway volume)
+/data

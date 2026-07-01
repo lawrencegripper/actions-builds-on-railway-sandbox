@@ -6,8 +6,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
+	"time"
 
 	"github.com/actions/scaleset"
 	"github.com/actions/scaleset/listener"
@@ -15,6 +17,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/lawrencegripper/railway-sandbox-github-actions-runner/internal/config"
+	"github.com/lawrencegripper/railway-sandbox-github-actions-runner/internal/dashboard"
 	"github.com/lawrencegripper/railway-sandbox-github-actions-runner/internal/scaler"
 )
 
@@ -124,6 +127,12 @@ func run(ctx context.Context, cfg *config.Config) error {
 		return fmt.Errorf("build runner template: %w", err)
 	}
 
+	store, err := dashboard.Open(dashboard.DBPath(), logger.WithGroup("dashboard"))
+	if err != nil {
+		return fmt.Errorf("open dashboard store: %w", err)
+	}
+	defer store.Close()
+
 	sc := scaler.New(scaler.Config{
 		ScaleSetID:           scaleSet.ID,
 		MinRunners:           cfg.MinRunners,
@@ -134,9 +143,24 @@ func run(ctx context.Context, cfg *config.Config) error {
 		NetworkIsolation:     cfg.NetworkIsolation(),
 		Provisioner:          railwayClient,
 		JitGenerator:         ssClient,
+		Sink:                 store,
 		Logger:               logger.WithGroup("scaler"),
 	})
 	defer sc.Shutdown(context.WithoutCancel(ctx))
+
+	dashSrv := dashboard.NewServer(store, sc, cfg.ScaleSetName, logger.WithGroup("dashboard"))
+	httpSrv := &http.Server{Addr: ":" + listenPort(), Handler: dashSrv.Routes()}
+	go func() {
+		logger.Info("dashboard listening", "addr", httpSrv.Addr)
+		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("dashboard server", "error", err.Error())
+		}
+	}()
+	defer func() {
+		shutCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		httpSrv.Shutdown(shutCtx)
+	}()
 
 	owner := hostname()
 	session, err := ssClient.MessageSessionClient(ctx, scaleSet.ID, owner)
@@ -159,6 +183,13 @@ func run(ctx context.Context, cfg *config.Config) error {
 		return fmt.Errorf("listener run: %w", err)
 	}
 	return nil
+}
+
+func listenPort() string {
+	if p := os.Getenv("PORT"); p != "" {
+		return p
+	}
+	return "8080"
 }
 
 func hostname() string {

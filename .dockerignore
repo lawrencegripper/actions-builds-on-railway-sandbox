@@ -5,3 +5,9 @@ README.md
 .env
 .env.*
 /out
+node_modules
+.railway
+package.json
+bun.lock
+bun.lockb
+/data

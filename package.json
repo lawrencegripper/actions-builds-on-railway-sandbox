@@ -1,0 +1,9 @@
+{
+  "name": "railway-sandbox-github-actions-runner-iac",
+  "private": true,
+  "type": "module",
+  "description": "Railway Infrastructure-as-Code for this project (.railway/railway.ts). Not part of the Go service build.",
+  "devDependencies": {
+    "railway": "^3.3.2"
+  }
+}
