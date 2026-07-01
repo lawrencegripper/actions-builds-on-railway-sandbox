@@ -8,17 +8,14 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"strconv"
-	"strings"
-	"unicode"
 
 	"github.com/actions/scaleset"
 	"github.com/actions/scaleset/listener"
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 
-	"github.com/lawrencegripper/railway-sandbox-actions/internal/config"
-	"github.com/lawrencegripper/railway-sandbox-actions/internal/scaler"
+	"github.com/lawrencegripper/railway-sandbox-github-actions-runner/internal/config"
+	"github.com/lawrencegripper/railway-sandbox-github-actions-runner/internal/scaler"
 )
 
 func main() {
@@ -34,7 +31,7 @@ func rootCmd() *cobra.Command {
 		Use:   "railway-sandbox-actions",
 		Short: "Run GitHub Actions runners as ephemeral Railway sandboxes via the scale set API",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if err := applyEnvOverrides(cmd, cfg); err != nil {
+			if err := cfg.ApplyEnv(cmd.Flags().Changed); err != nil {
 				return err
 			}
 			ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt)
@@ -73,82 +70,6 @@ func rootCmd() *cobra.Command {
 
 	cmd.AddCommand(smokeCmd(cfg))
 	return cmd
-}
-
-// applyEnvOverrides fills config from environment variables for any flag the
-// user did not explicitly set, so the service can be driven entirely by Railway
-// variables. Explicit flags win over env.
-func applyEnvOverrides(cmd *cobra.Command, cfg *config.Config) error {
-	f := cmd.Flags()
-	str := func(flag, env string, dst *string) {
-		if !f.Changed(flag) {
-			if v, ok := os.LookupEnv(env); ok {
-				*dst = v
-			}
-		}
-	}
-	intVar := func(flag, env string, dst *int) error {
-		if f.Changed(flag) {
-			return nil
-		}
-		v, ok := os.LookupEnv(env)
-		if !ok {
-			return nil
-		}
-		n, err := strconv.Atoi(v)
-		if err != nil {
-			return fmt.Errorf("invalid %s=%q: %w", env, v, err)
-		}
-		*dst = n
-		return nil
-	}
-
-	str("url", "GITHUB_URL", &cfg.RegistrationURL)
-	str("name", "SCALE_SET_NAME", &cfg.ScaleSetName)
-	str("runner-group", "RUNNER_GROUP", &cfg.RunnerGroup)
-	str("token", "GITHUB_TOKEN", &cfg.Token)
-	str("app-client-id", "GITHUB_APP_CLIENT_ID", &cfg.GitHubApp.ClientID)
-	str("app-private-key", "GITHUB_APP_PRIVATE_KEY", &cfg.GitHubApp.PrivateKey)
-	str("runner-version", "RUNNER_VERSION", &cfg.RunnerVersion)
-	str("extra-setup", "EXTRA_SETUP", &cfg.ExtraSetup)
-	str("log-level", "LOG_LEVEL", &cfg.LogLevel)
-	str("log-format", "LOG_FORMAT", &cfg.LogFormat)
-
-	if !f.Changed("extra-packages") {
-		if v, ok := os.LookupEnv("EXTRA_PACKAGES"); ok && v != "" {
-			cfg.ExtraPackages = splitList(v)
-		}
-	}
-
-	if !f.Changed("labels") {
-		if v, ok := os.LookupEnv("RUNNER_LABELS"); ok && v != "" {
-			cfg.Labels = splitList(v)
-		}
-	}
-	if !f.Changed("app-installation-id") {
-		if v, ok := os.LookupEnv("GITHUB_APP_INSTALLATION_ID"); ok {
-			n, err := strconv.ParseInt(v, 10, 64)
-			if err != nil {
-				return fmt.Errorf("invalid GITHUB_APP_INSTALLATION_ID=%q: %w", v, err)
-			}
-			cfg.GitHubApp.InstallationID = n
-		}
-	}
-	if !f.Changed("enable-private-networking") {
-		if v, ok := os.LookupEnv("ENABLE_PRIVATE_NETWORKING"); ok {
-			cfg.EnablePrivateNetworking = truthy(v)
-		}
-	}
-	if err := intVar("min-runners", "MIN_RUNNERS", &cfg.MinRunners); err != nil {
-		return err
-	}
-	if err := intVar("max-runners", "MAX_RUNNERS", &cfg.MaxRunners); err != nil {
-		return err
-	}
-	if err := intVar("idle-timeout-minutes", "IDLE_TIMEOUT_MINUTES", &cfg.IdleTimeoutMinutes); err != nil {
-		return err
-	}
-	return nil
 }
 
 func run(ctx context.Context, cfg *config.Config) error {
@@ -238,19 +159,6 @@ func run(ctx context.Context, cfg *config.Config) error {
 		return fmt.Errorf("listener run: %w", err)
 	}
 	return nil
-}
-
-// splitList parses a comma/whitespace-separated env value, dropping empties.
-func splitList(v string) []string {
-	return strings.FieldsFunc(v, func(r rune) bool { return r == ',' || unicode.IsSpace(r) })
-}
-
-func truthy(v string) bool {
-	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "1", "true", "yes", "on":
-		return true
-	}
-	return false
 }
 
 func hostname() string {

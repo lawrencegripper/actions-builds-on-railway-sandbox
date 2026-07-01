@@ -14,7 +14,7 @@ import (
 func TestDeriveTCPProxyWsEndpoint(t *testing.T) {
 	cases := map[string]string{
 		"https://backboard.railway.com/graphql/v2":         "wss://ssh.railway.com:2226/ws/exec",
-		"https://backboard.railway-develop.com/graphql/v2": "wss://ssh.railway-develop.com:2226/ws/exec",
+		"https://backboard.eu-west.example.com/graphql/v2": "wss://ssh.eu-west.example.com:2226/ws/exec",
 		"https://example.com/graphql":                      "wss://ssh.example.com:2226/ws/exec",
 	}
 	for in, want := range cases {

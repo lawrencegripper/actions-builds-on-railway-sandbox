@@ -158,3 +158,10 @@ Customize the image without forking:
 - **`EXTRA_SETUP`** — an arbitrary shell step run last (e.g. `pip install uv`).
 
 Because the template is content-addressed, changing any of these (or the runner version) produces a new cached image automatically — no manual rebuild.
+
+## Security notes
+
+- **Untrusted job code runs inside the sandbox as root, with dockerd.** The sandbox is the isolation boundary; it is created per job and destroyed on completion. `--enable-private-networking` widens the blast radius — with it on, a malicious workflow can reach your environment's private services, so enable it only for trusted repos.
+- **Pin `RUNNER_VERSION` in production.** Left unset it tracks the latest `actions/runner` release; pinning gives reproducible, reviewable builds. The runner tarball is fetched over HTTPS from github.com; there is no separate checksum step, so pinning is your supply-chain control.
+- **`EXTRA_SETUP`/`EXTRA_PACKAGES` are shell run at image-build time** — treat them as trusted operator input. `RUNNER_VERSION` and `--runner-workdir` are validated (semver / absolute-path) before they reach a shell step.
+- **Secrets** (Railway tokens, GitHub PAT/App key, the exec JWT, the JIT config) travel in HTTP headers, WebSocket subprotocols, or the exec env frame — never in a command line — and job stdout/stderr is not streamed into the orchestrator's logs.

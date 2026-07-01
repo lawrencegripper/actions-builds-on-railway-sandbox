@@ -16,6 +16,78 @@ func TestResolveRunnerVersionExplicit(t *testing.T) {
 	}
 }
 
+func TestResolveRunnerVersionRejectsGarbage(t *testing.T) {
+	c := &Config{RunnerVersion: "1.2"} // not X.Y.Z
+	if err := c.ResolveRunnerVersion(context.Background()); err == nil {
+		t.Fatal("expected rejection of malformed version")
+	}
+}
+
+func TestValidateRejectsUnsafeWorkdir(t *testing.T) {
+	c := &Config{
+		RegistrationURL:      "https://github.com/o/r",
+		ScaleSetName:         "x",
+		Token:                "t",
+		MaxRunners:           1,
+		RailwayProjectToken:  "p",
+		RailwayEnvironmentID: "e",
+		RunnerWorkdir:        "/app; rm -rf /",
+	}
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected unsafe --runner-workdir to be rejected")
+	}
+}
+
+func allUnset(string) bool { return false }
+
+func TestApplyEnvReadsWhenFlagUnset(t *testing.T) {
+	t.Setenv("GITHUB_URL", "https://github.com/o/r")
+	t.Setenv("MAX_RUNNERS", "9")
+	t.Setenv("RUNNER_LABELS", "a, b ,c")
+	t.Setenv("EXTRA_PACKAGES", "python3 ffmpeg")
+	t.Setenv("ENABLE_PRIVATE_NETWORKING", "yes")
+	t.Setenv("GITHUB_APP_INSTALLATION_ID", "42")
+	t.Setenv("RAILWAY_PROJECT_TOKEN", "ptok")
+
+	c := &Config{}
+	if err := c.ApplyEnv(allUnset); err != nil {
+		t.Fatal(err)
+	}
+	if c.RegistrationURL != "https://github.com/o/r" || c.MaxRunners != 9 {
+		t.Errorf("string/int env not applied: %+v", c)
+	}
+	if len(c.Labels) != 3 || c.Labels[0] != "a" || c.Labels[2] != "c" {
+		t.Errorf("labels not split/trimmed: %v", c.Labels)
+	}
+	if len(c.ExtraPackages) != 2 {
+		t.Errorf("extra packages not split: %v", c.ExtraPackages)
+	}
+	if !c.EnablePrivateNetworking {
+		t.Error("truthy env not applied")
+	}
+	if c.GitHubApp.InstallationID != 42 || c.RailwayProjectToken != "ptok" {
+		t.Errorf("int64/railway env not applied: %+v", c.GitHubApp)
+	}
+}
+
+func TestApplyEnvFlagWins(t *testing.T) {
+	t.Setenv("GITHUB_URL", "https://env")
+	c := &Config{RegistrationURL: "https://flag"}
+	if err := c.ApplyEnv(func(f string) bool { return f == "url" }); err != nil {
+		t.Fatal(err)
+	}
+	if c.RegistrationURL != "https://flag" {
+		t.Errorf("explicit flag should win over env, got %q", c.RegistrationURL)
+	}
+}
+
+func TestApplyEnvBadInt(t *testing.T) {
+	t.Setenv("MAX_RUNNERS", "notanint")
+	if err := (&Config{}).ApplyEnv(allUnset); err == nil {
+		t.Fatal("expected error on non-integer MAX_RUNNERS")
+	}
+}
+
 func TestRunnerTemplateInstructions(t *testing.T) {
 	c := &Config{RunnerVersion: "2.328.0", RunnerWorkdir: "/actions-runner"}
 	steps := c.RunnerTemplateInstructions()

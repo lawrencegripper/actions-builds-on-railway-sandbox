@@ -10,18 +10,27 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/actions/scaleset"
 
-	"github.com/lawrencegripper/railway-sandbox-actions/internal/railway"
+	"github.com/lawrencegripper/railway-sandbox-github-actions-runner/internal/railway"
 )
 
 const (
 	defaultRunnerWorkdir = "/actions-runner"
 
 	latestRunnerReleaseURL = "https://api.github.com/repos/actions/runner/releases/latest"
+
+	// These values are interpolated into shell build steps, so constrain them to
+	// safe shapes (defense-in-depth against injection even though only the
+	// operator sets them).
+	runnerVersionPattern = `^[0-9]+\.[0-9]+\.[0-9]+$`
+	runnerWorkdirPattern = `^/[A-Za-z0-9._/-]+$`
 
 	// RunnerStartCommand is the start script baked into the template image. It
 	// fixes the sandbox's minimal PATH, starts dockerd, then runs the ephemeral
@@ -32,6 +41,11 @@ const (
 // baseToolchain is installed into every runner image: generic tools most
 // workflows expect, including docker for container/service jobs. The actions
 // runner's own .NET deps are handled separately by installdependencies.sh.
+var (
+	runnerVersionRe = regexp.MustCompile(runnerVersionPattern)
+	runnerWorkdirRe = regexp.MustCompile(runnerWorkdirPattern)
+)
+
 var baseToolchain = []string{
 	"bash",
 	"ca-certificates",
@@ -83,18 +97,95 @@ func (c *Config) Defaults() {
 	if c.RunnerWorkdir == "" {
 		c.RunnerWorkdir = defaultRunnerWorkdir
 	}
-	if c.RailwayToken == "" {
-		c.RailwayToken = os.Getenv("RAILWAY_API_TOKEN")
+}
+
+// ApplyEnv fills config from environment variables for any flag the caller
+// reports as not explicitly set (via changed), so the service can be driven
+// entirely by Railway variables. Explicit flags win over env. Pass a predicate
+// that always returns false to read purely from env (e.g. contexts with no flags).
+func (c *Config) ApplyEnv(changed func(flag string) bool) error {
+	str := func(flag, env string, dst *string) {
+		if !changed(flag) {
+			if v, ok := os.LookupEnv(env); ok {
+				*dst = v
+			}
+		}
 	}
-	if c.RailwayProjectToken == "" {
-		c.RailwayProjectToken = os.Getenv("RAILWAY_PROJECT_TOKEN")
+	str("url", "GITHUB_URL", &c.RegistrationURL)
+	str("name", "SCALE_SET_NAME", &c.ScaleSetName)
+	str("runner-group", "RUNNER_GROUP", &c.RunnerGroup)
+	str("token", "GITHUB_TOKEN", &c.Token)
+	str("app-client-id", "GITHUB_APP_CLIENT_ID", &c.GitHubApp.ClientID)
+	str("app-private-key", "GITHUB_APP_PRIVATE_KEY", &c.GitHubApp.PrivateKey)
+	str("runner-version", "RUNNER_VERSION", &c.RunnerVersion)
+	str("extra-setup", "EXTRA_SETUP", &c.ExtraSetup)
+	str("log-level", "LOG_LEVEL", &c.LogLevel)
+	str("log-format", "LOG_FORMAT", &c.LogFormat)
+	str("railway-token", "RAILWAY_API_TOKEN", &c.RailwayToken)
+	str("railway-project-token", "RAILWAY_PROJECT_TOKEN", &c.RailwayProjectToken)
+	str("railway-environment-id", "RAILWAY_ENVIRONMENT_ID", &c.RailwayEnvironmentID)
+	str("railway-endpoint", "RAILWAY_GRAPHQL_ENDPOINT", &c.RailwayEndpoint)
+
+	if !changed("labels") {
+		if v, ok := os.LookupEnv("RUNNER_LABELS"); ok && v != "" {
+			c.Labels = splitList(v)
+		}
 	}
-	if c.RailwayEnvironmentID == "" {
-		c.RailwayEnvironmentID = os.Getenv("RAILWAY_ENVIRONMENT_ID")
+	if !changed("extra-packages") {
+		if v, ok := os.LookupEnv("EXTRA_PACKAGES"); ok && v != "" {
+			c.ExtraPackages = splitList(v)
+		}
 	}
-	if c.RailwayEndpoint == "" {
-		c.RailwayEndpoint = os.Getenv("RAILWAY_GRAPHQL_ENDPOINT")
+	if !changed("enable-private-networking") {
+		if v, ok := os.LookupEnv("ENABLE_PRIVATE_NETWORKING"); ok {
+			c.EnablePrivateNetworking = truthy(v)
+		}
 	}
+	if !changed("app-installation-id") {
+		if v, ok := os.LookupEnv("GITHUB_APP_INSTALLATION_ID"); ok {
+			n, err := strconv.ParseInt(v, 10, 64)
+			if err != nil {
+				return fmt.Errorf("invalid GITHUB_APP_INSTALLATION_ID=%q: %w", v, err)
+			}
+			c.GitHubApp.InstallationID = n
+		}
+	}
+	if err := intEnv(changed, "min-runners", "MIN_RUNNERS", &c.MinRunners); err != nil {
+		return err
+	}
+	if err := intEnv(changed, "max-runners", "MAX_RUNNERS", &c.MaxRunners); err != nil {
+		return err
+	}
+	return intEnv(changed, "idle-timeout-minutes", "IDLE_TIMEOUT_MINUTES", &c.IdleTimeoutMinutes)
+}
+
+func intEnv(changed func(string) bool, flag, env string, dst *int) error {
+	if changed(flag) {
+		return nil
+	}
+	v, ok := os.LookupEnv(env)
+	if !ok {
+		return nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return fmt.Errorf("invalid %s=%q: %w", env, v, err)
+	}
+	*dst = n
+	return nil
+}
+
+// splitList parses a comma/whitespace-separated env value, dropping empties.
+func splitList(v string) []string {
+	return strings.FieldsFunc(v, func(r rune) bool { return r == ',' || unicode.IsSpace(r) })
+}
+
+func truthy(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 func (c *Config) Validate() error {
@@ -121,6 +212,9 @@ func (c *Config) Validate() error {
 	}
 	if c.RailwayEnvironmentID == "" {
 		return fmt.Errorf("Railway environment id required (--railway-environment-id or RAILWAY_ENVIRONMENT_ID)")
+	}
+	if !runnerWorkdirRe.MatchString(c.RunnerWorkdir) {
+		return fmt.Errorf("--runner-workdir must be an absolute path of [A-Za-z0-9._/-]: %q", c.RunnerWorkdir)
 	}
 	return nil
 }
@@ -209,7 +303,7 @@ func (c *Config) BuildLabels() []scaleset.Label {
 func (c *Config) ResolveRunnerVersion(ctx context.Context) error {
 	if c.RunnerVersion != "" {
 		c.RunnerVersion = strings.TrimPrefix(c.RunnerVersion, "v")
-		return nil
+		return c.validateRunnerVersion()
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
@@ -241,6 +335,13 @@ func (c *Config) ResolveRunnerVersion(ctx context.Context) error {
 		return fmt.Errorf("latest runner release has no tag_name")
 	}
 	c.RunnerVersion = strings.TrimPrefix(release.TagName, "v")
+	return c.validateRunnerVersion()
+}
+
+func (c *Config) validateRunnerVersion() error {
+	if !runnerVersionRe.MatchString(c.RunnerVersion) {
+		return fmt.Errorf("runner version must look like X.Y.Z: %q", c.RunnerVersion)
+	}
 	return nil
 }
 

@@ -12,7 +12,7 @@ import (
 	"github.com/actions/scaleset/listener"
 	"github.com/google/uuid"
 
-	"github.com/lawrencegripper/railway-sandbox-actions/internal/railway"
+	"github.com/lawrencegripper/railway-sandbox-github-actions-runner/internal/railway"
 )
 
 // Provisioner is the subset of the Railway client the scaler needs (kept small
@@ -51,6 +51,12 @@ type Scaler struct {
 	cfg    Config
 	log    *slog.Logger
 	runner *runnerState
+
+	// Runner goroutines run under bgCtx (not the listener's ctx) so a job
+	// outlives a single poll, and are tracked by wg so Shutdown can wait them out.
+	bgCtx  context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 }
 
 var _ listener.Scaler = (*Scaler)(nil)
@@ -62,9 +68,12 @@ func New(cfg Config) *Scaler {
 	if cfg.StartCommand == "" {
 		cfg.StartCommand = "/usr/local/bin/start-runner"
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Scaler{
-		cfg: cfg,
-		log: cfg.Logger,
+		cfg:    cfg,
+		log:    cfg.Logger,
+		bgCtx:  ctx,
+		cancel: cancel,
 		runner: &runnerState{
 			provisioning: make(map[string]struct{}),
 			idle:         make(map[string]string),
@@ -76,21 +85,24 @@ func New(cfg Config) *Scaler {
 // HandleDesiredRunnerCount reserves capacity synchronously, then provisions the
 // sandboxes asynchronously so the listener's poll loop is not blocked by the
 // minute-or-so a sandbox boot can take.
-func (s *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, error) {
+func (s *Scaler) HandleDesiredRunnerCount(_ context.Context, count int) (int, error) {
 	target := min(s.cfg.MaxRunners, s.cfg.MinRunners+count)
 
-	for {
-		current := s.runner.count()
-		if current >= target {
-			return current, nil
-		}
+	// Bounded: reserve up to (target - current) slots, provisioning each async so
+	// the listener's poll loop is not blocked by the minute-or-so a boot takes.
+	for need := target - s.runner.count(); need > 0; need-- {
 		name := fmt.Sprintf("runner-%s", uuid.NewString()[:8])
 		if !s.runner.reserve(name) {
 			continue
 		}
-		s.log.Info("scaling up", slog.Int("current", current), slog.Int("target", target), slog.String("runner", name))
-		go s.provision(context.WithoutCancel(ctx), name)
+		s.log.Info("scaling up", slog.Int("target", target), slog.String("runner", name))
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.provision(s.bgCtx, name)
+		}()
 	}
+	return s.runner.count(), nil
 }
 
 func (s *Scaler) provision(ctx context.Context, name string) {
@@ -119,27 +131,42 @@ func (s *Scaler) provision(ctx context.Context, name string) {
 		return
 	}
 	s.log.Info("sandbox ready, starting runner", slog.String("runner", name), slog.String("sandbox", sb.ID))
-	go s.runRunner(ctx, name, sb.ID, jit.EncodedJITConfig)
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.runRunner(ctx, name, sb.ID, jit.EncodedJITConfig)
+	}()
 }
 
-// runRunner execs run.sh, which reads ACTIONS_RUNNER_INPUT_JITCONFIG and runs
-// exactly one job, then exits. The runner refuses to run as root unless
-// RUNNER_ALLOW_RUNASROOT=1.
+// runRunner execs the start script, which runs exactly one job then exits. On
+// any return path (success, exec error, or the job's ctx being cancelled at
+// shutdown) it tears the sandbox down, so nothing leaks even when GitHub never
+// sends a JobCompleted. Job stdout/stderr is intentionally not streamed into the
+// orchestrator's logs — it can contain secrets and already lives in GitHub's job
+// log.
 func (s *Scaler) runRunner(ctx context.Context, name, sandboxID, jitConfig string) {
 	rlog := s.log.With(slog.String("runner", name), slog.String("sandbox", sandboxID))
+	defer s.finish(name, sandboxID)
+
 	res, err := s.cfg.Provisioner.Exec(ctx, sandboxID, s.cfg.StartCommand, railway.ExecOptions{
 		Env: map[string]string{
 			"ACTIONS_RUNNER_INPUT_JITCONFIG": jitConfig,
 			"RUNNER_ALLOW_RUNASROOT":         "1",
 		},
-		OnStdout: func(b []byte) { rlog.Debug("runner stdout", slog.String("line", string(b))) },
-		OnStderr: func(b []byte) { rlog.Debug("runner stderr", slog.String("line", string(b))) },
 	})
 	if err != nil {
 		rlog.Error("runner exec failed", slog.String("error", err.Error()))
 		return
 	}
 	rlog.Info("runner exec exited", slog.Int("exitCode", res.ExitCode))
+}
+
+// finish removes the runner from tracking and destroys its sandbox, unless a
+// concurrent HandleJobCompleted already claimed it (remove reports not-found).
+func (s *Scaler) finish(name, sandboxID string) {
+	if _, ok := s.runner.remove(name); ok {
+		s.destroy(context.WithoutCancel(s.bgCtx), sandboxID)
+	}
 }
 
 func (s *Scaler) HandleJobStarted(ctx context.Context, jobInfo *scaleset.JobStarted) error {
@@ -171,8 +198,12 @@ func (s *Scaler) destroy(ctx context.Context, sandboxID string) {
 	s.log.Info("sandbox destroyed", slog.String("sandbox", sandboxID))
 }
 
-// Shutdown destroys every tracked sandbox. Call on exit.
+// Shutdown stops provisioning, cancels in-flight runner goroutines and waits for
+// them to tear their own sandboxes down, then destroys any stragglers. Call on
+// exit. Safe to call once.
 func (s *Scaler) Shutdown(ctx context.Context) {
+	s.cancel()
+	s.wg.Wait()
 	for _, id := range s.runner.drain() {
 		s.destroy(ctx, id)
 	}
@@ -257,19 +288,6 @@ func (r *runnerState) remove(name string) (string, bool) {
 		return "", true
 	}
 	return "", false
-}
-
-func (r *runnerState) idleSandbox(name string) (string, bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	id, ok := r.idle[name]
-	return id, ok
-}
-
-func (r *runnerState) idleCount() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return len(r.idle)
 }
 
 func (r *runnerState) drain() []string {

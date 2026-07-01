@@ -2,6 +2,7 @@ package scaler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -10,7 +11,7 @@ import (
 
 	"github.com/actions/scaleset"
 
-	"github.com/lawrencegripper/railway-sandbox-actions/internal/railway"
+	"github.com/lawrencegripper/railway-sandbox-github-actions-runner/internal/railway"
 )
 
 type fakeProvisioner struct {
@@ -19,7 +20,8 @@ type fakeProvisioner struct {
 	execCount   atomic.Int32
 	destroyed   []string
 	created     []string
-	blockExec   chan struct{} // if set, Exec blocks until closed
+	blockExec   chan struct{} // if set, Exec blocks until closed or ctx is cancelled
+	execErr     error         // if set, Exec fails with this error
 }
 
 func (f *fakeProvisioner) CreateSandbox(_ context.Context, _ railway.CreateOptions) (*railway.Sandbox, error) {
@@ -38,10 +40,17 @@ func (f *fakeProvisioner) DestroySandbox(_ context.Context, id string) error {
 	return nil
 }
 
-func (f *fakeProvisioner) Exec(_ context.Context, _, _ string, _ railway.ExecOptions) (*railway.ExecResult, error) {
+func (f *fakeProvisioner) Exec(ctx context.Context, _, _ string, _ railway.ExecOptions) (*railway.ExecResult, error) {
 	f.execCount.Add(1)
+	if f.execErr != nil {
+		return nil, f.execErr
+	}
 	if f.blockExec != nil {
-		<-f.blockExec
+		select {
+		case <-f.blockExec:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 	return &railway.ExecResult{ExitCode: 0}, nil
 }
@@ -82,6 +91,20 @@ func waitFor(t *testing.T, cond func() bool, msg string) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for: %s", msg)
+}
+
+// test-only views into runnerState.
+func (r *runnerState) idleSandbox(name string) (string, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	id, ok := r.idle[name]
+	return id, ok
+}
+
+func (r *runnerState) idleCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.idle)
 }
 
 func TestScaleUpToDesired(t *testing.T) {
@@ -136,10 +159,9 @@ func TestCapAtMaxRunners(t *testing.T) {
 }
 
 func TestJobCompletedDestroysSandbox(t *testing.T) {
-	p := &fakeProvisioner{}
+	p := &fakeProvisioner{blockExec: make(chan struct{})}
 	s := newTestScaler(p, &fakeJit{}, 0, 5)
 
-	// Reserve+provision one runner with a known name.
 	name := "runner-x"
 	if !s.runner.reserve(name) {
 		t.Fatal("reserve failed")
@@ -164,8 +186,29 @@ func TestJobCompletedDestroysSandbox(t *testing.T) {
 	if s.runner.count() != 0 {
 		t.Fatalf("expected 0 tracked runners, got %d", s.runner.count())
 	}
+	// Let the (still-blocked) runner goroutine exit; its finish() must not
+	// double-destroy since the runner was already removed.
+	close(p.blockExec)
+	waitFor(t, func() bool { return len(p.destroyedList()) == 1 }, "no double destroy")
 }
 
+// A runner whose exec fails (before GitHub ever sends JobCompleted) must still
+// have its sandbox torn down and be untracked.
+func TestRunnerExecFailureDestroysSandbox(t *testing.T) {
+	p := &fakeProvisioner{execErr: errors.New("boom")}
+	s := newTestScaler(p, &fakeJit{}, 0, 5)
+
+	name := "runner-fail"
+	if !s.runner.reserve(name) {
+		t.Fatal("reserve failed")
+	}
+	s.provision(context.Background(), name)
+
+	waitFor(t, func() bool { return len(p.destroyedList()) == 1 }, "sandbox destroyed after exec failure")
+	waitFor(t, func() bool { return s.runner.count() == 0 }, "runner untracked after failure")
+}
+
+// Shutdown must cancel in-flight runners, wait for them, and leave nothing tracked.
 func TestShutdownDestroysAll(t *testing.T) {
 	p := &fakeProvisioner{blockExec: make(chan struct{})}
 	s := newTestScaler(p, &fakeJit{}, 0, 5)
@@ -173,11 +216,13 @@ func TestShutdownDestroysAll(t *testing.T) {
 	waitFor(t, func() bool { return p.createCount.Load() == 3 }, "3 created")
 	waitFor(t, func() bool { return s.runner.idleCount() == 3 }, "3 idle")
 
-	s.Shutdown(context.Background())
+	s.Shutdown(context.Background()) // cancels blocked execs, waits, cleans up
 	if len(p.destroyedList()) != 3 {
 		t.Fatalf("expected 3 destroyed, got %d", len(p.destroyedList()))
 	}
-	close(p.blockExec)
+	if s.runner.count() != 0 {
+		t.Fatalf("expected 0 tracked runners after shutdown, got %d", s.runner.count())
+	}
 }
 
 func TestRunnerStateTransitions(t *testing.T) {

@@ -234,7 +234,17 @@ func (c *Client) CreateSandbox(ctx context.Context, opts CreateOptions) (*Sandbo
 		return nil, err
 	}
 	c.log.Info("sandbox created", slog.String("id", data.SandboxCreate.ID), slog.String("status", string(data.SandboxCreate.Status)))
-	return c.waitForRunning(ctx, data.SandboxCreate)
+	sb, err := c.waitForRunning(ctx, data.SandboxCreate)
+	if err != nil {
+		// The sandbox exists server-side even though it never became RUNNING;
+		// best-effort destroy so a readiness failure doesn't leak it. Use a
+		// detached context so a cancelled ctx still lets the cleanup through.
+		if derr := c.DestroySandbox(context.WithoutCancel(ctx), data.SandboxCreate.ID); derr != nil {
+			c.log.Error("failed to destroy sandbox after readiness failure", slog.String("id", data.SandboxCreate.ID), slog.String("error", derr.Error()))
+		}
+		return nil, err
+	}
+	return sb, nil
 }
 
 func (c *Client) waitForRunning(ctx context.Context, sb Sandbox) (*Sandbox, error) {
@@ -298,15 +308,14 @@ const (
 )
 
 type templateBuild struct {
-	ID            string              `json:"id"`
-	Status        TemplateBuildStatus `json:"status"`
-	EnvironmentID string              `json:"environmentId"`
+	ID     string              `json:"id"`
+	Status TemplateBuildStatus `json:"status"`
 }
 
 // BuildTemplateUntilReady pre-warms a template build so later CreateSandbox
 // calls fork from the cached build instead of building inline.
 func (c *Client) BuildTemplateUntilReady(ctx context.Context, instructions []string) error {
-	query := `mutation($environmentId: String!, $input: SandboxTemplateInput!){ sandboxTemplateBuild(environmentId: $environmentId, input: $input){ id status environmentId } }`
+	query := `mutation($environmentId: String!, $input: SandboxTemplateInput!){ sandboxTemplateBuild(environmentId: $environmentId, input: $input){ id status } }`
 	input := map[string]any{"instructions": instructions}
 	var data struct {
 		SandboxTemplateBuild templateBuild `json:"sandboxTemplateBuild"`
@@ -317,7 +326,7 @@ func (c *Client) BuildTemplateUntilReady(ctx context.Context, instructions []str
 	build := data.SandboxTemplateBuild
 	c.log.Info("template build started", slog.String("id", build.ID), slog.String("status", string(build.Status)))
 
-	statusQuery := `query($environmentId: String!, $id: ID!){ sandboxTemplateBuild(environmentId: $environmentId, id: $id){ id status environmentId } }`
+	statusQuery := `query($environmentId: String!, $id: ID!){ sandboxTemplateBuild(environmentId: $environmentId, id: $id){ id status } }`
 	deadline := time.Now().Add(readinessTimeout)
 	delay := pollInitialDelay
 	for {

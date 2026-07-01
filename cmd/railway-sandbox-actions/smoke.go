@@ -8,8 +8,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/lawrencegripper/railway-sandbox-actions/internal/config"
-	"github.com/lawrencegripper/railway-sandbox-actions/internal/railway"
+	"github.com/lawrencegripper/railway-sandbox-github-actions-runner/internal/config"
+	"github.com/lawrencegripper/railway-sandbox-github-actions-runner/internal/railway"
 )
 
 // smokeCmd exercises the Railway path only (create sandbox -> exec -> destroy),
@@ -22,6 +22,9 @@ func smokeCmd(cfg *config.Config) *cobra.Command {
 		Use:   "smoke",
 		Short: "Create a sandbox, run a command, and destroy it (Railway transport check)",
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := cfg.ApplyEnv(cmd.Flags().Changed); err != nil {
+				return err
+			}
 			cfg.Defaults()
 			if cfg.RailwayToken == "" || cfg.RailwayEnvironmentID == "" {
 				return fmt.Errorf("set RAILWAY_API_TOKEN and RAILWAY_ENVIRONMENT_ID (or --railway-* flags)")
