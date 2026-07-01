@@ -64,7 +64,9 @@ Then set the service's variables. At a minimum: a Railway token, `GITHUB_URL`, `
 
 ## Dashboard
 
-The service serves a read-only status page on `PORT` (default `8080` locally): live runner counts, jobs over the last 7 days, durations, and recent jobs. It records job history to SQLite at `$RAILWAY_VOLUME_MOUNT_PATH/dashboard.db` when a Railway volume is attached, falling back to `./data/dashboard.db` for local runs. There is no auth, so put it behind a private network or add one if the domain is public.
+The service serves a read-only status page on `PORT` (default `8080` locally): live runner counts, jobs over the last 7 days, durations, recent jobs (each linked to its Railway sandbox when `RAILWAY_PROJECT_ID` and `RAILWAY_ENVIRONMENT_ID` are present), and the recent template builds with a per-build detail page at `/builds/<id>` for debugging failures. It records history to SQLite at `$RAILWAY_VOLUME_MOUNT_PATH/dashboard.db` when a Railway volume is attached, falling back to `./data/dashboard.db` for local runs. There is no auth, so put it behind a private network or add one if the domain is public.
+
+Railway's API does not expose per-line template build logs (the `SandboxTemplateBuild` resource is only a content-addressed id plus a status), so the build detail page shows the resolved runner version, the recipe, status, timing, and any error instead.
 
 ## Smoke test (Railway transport only, no GitHub)
 

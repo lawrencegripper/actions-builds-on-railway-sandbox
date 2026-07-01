@@ -42,14 +42,14 @@ func (c Counts) Total() int { return c.Provisioning + c.Idle + c.Busy }
 // scaler runs them inline on the listener/runner paths. A nil sink is replaced
 // with a no-op so the scaler works without one.
 type EventSink interface {
-	JobStarted(runnerName string)
-	JobCompleted(runnerName, result string)
+	JobStarted(runnerName, sandboxID string)
+	JobCompleted(runnerName, sandboxID, result string)
 }
 
 type nopSink struct{}
 
-func (nopSink) JobStarted(string)           {}
-func (nopSink) JobCompleted(string, string) {}
+func (nopSink) JobStarted(string, string)           {}
+func (nopSink) JobCompleted(string, string, string) {}
 
 // Config configures the Scaler.
 type Config struct {
@@ -199,15 +199,15 @@ func (s *Scaler) finish(name, sandboxID string) {
 
 func (s *Scaler) HandleJobStarted(ctx context.Context, jobInfo *scaleset.JobStarted) error {
 	s.log.Info("job started", slog.String("runner", jobInfo.RunnerName), slog.String("jobId", jobInfo.JobID))
-	s.runner.markBusy(jobInfo.RunnerName)
-	s.cfg.Sink.JobStarted(jobInfo.RunnerName)
+	sandboxID := s.runner.markBusy(jobInfo.RunnerName)
+	s.cfg.Sink.JobStarted(jobInfo.RunnerName, sandboxID)
 	return nil
 }
 
 func (s *Scaler) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCompleted) error {
 	s.log.Info("job completed", slog.String("runner", jobInfo.RunnerName), slog.String("result", jobInfo.Result))
-	s.cfg.Sink.JobCompleted(jobInfo.RunnerName, jobInfo.Result)
 	sandboxID, ok := s.runner.remove(jobInfo.RunnerName)
+	s.cfg.Sink.JobCompleted(jobInfo.RunnerName, sandboxID, jobInfo.Result)
 	if !ok {
 		s.log.Warn("job completed for unknown runner", slog.String("runner", jobInfo.RunnerName))
 		return nil
@@ -306,13 +306,20 @@ func (r *runnerState) markIdle(name, sandboxID string) bool {
 	return true
 }
 
-func (r *runnerState) markBusy(name string) {
+// markBusy promotes an idle runner to busy and returns its sandbox id (empty if
+// the runner is not tracked as idle).
+func (r *runnerState) markBusy(name string) string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if id, ok := r.idle[name]; ok {
 		delete(r.idle, name)
 		r.busy[name] = id
+		return id
 	}
+	if id, ok := r.busy[name]; ok {
+		return id
+	}
+	return ""
 }
 
 // remove drops a runner from tracking and returns its sandbox id. The bool is

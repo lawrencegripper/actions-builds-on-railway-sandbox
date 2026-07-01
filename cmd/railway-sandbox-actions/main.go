@@ -6,9 +6,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"time"
 
 	"github.com/actions/scaleset"
@@ -18,6 +20,7 @@ import (
 
 	"github.com/lawrencegripper/railway-sandbox-github-actions-runner/internal/config"
 	"github.com/lawrencegripper/railway-sandbox-github-actions-runner/internal/dashboard"
+	"github.com/lawrencegripper/railway-sandbox-github-actions-runner/internal/railway"
 	"github.com/lawrencegripper/railway-sandbox-github-actions-runner/internal/scaler"
 )
 
@@ -119,19 +122,22 @@ func run(ctx context.Context, cfg *config.Config) error {
 	if err := cfg.ResolveRunnerVersion(ctx); err != nil {
 		return err
 	}
-	instructions := cfg.RunnerTemplateInstructions()
-	// Runners boot from a prebuilt, content-addressed template image. Ensure it
-	// exists before listening; Railway reuses the cached build if it already does.
-	logger.Info("building runner template", "runnerVersion", cfg.RunnerVersion)
-	if err := railwayClient.BuildTemplateUntilReady(ctx, instructions); err != nil {
-		return fmt.Errorf("build runner template: %w", err)
-	}
-
 	store, err := dashboard.Open(dashboard.DBPath(), logger.WithGroup("dashboard"))
 	if err != nil {
 		return fmt.Errorf("open dashboard store: %w", err)
 	}
 	defer store.Close()
+
+	instructions := cfg.RunnerTemplateInstructions()
+	// Runners boot from a prebuilt, content-addressed template image. Ensure it
+	// exists before listening; Railway reuses the cached build if it already does.
+	logger.Info("building runner template", "runnerVersion", cfg.RunnerVersion)
+	started := time.Now()
+	res, buildErr := railwayClient.BuildTemplateUntilReady(ctx, instructions)
+	recordTemplateBuild(store, logger, cfg, res, buildErr, started, instructions)
+	if buildErr != nil {
+		return fmt.Errorf("build runner template: %w", buildErr)
+	}
 
 	sc := scaler.New(scaler.Config{
 		ScaleSetID:           scaleSet.ID,
@@ -183,6 +189,31 @@ func run(ctx context.Context, cfg *config.Config) error {
 		return fmt.Errorf("listener run: %w", err)
 	}
 	return nil
+}
+
+// recordTemplateBuild persists a template build attempt for the dashboard.
+// Railway does not expose per-line build logs (the SandboxTemplateBuild type is
+// only id + status), so we store the resolved version, recipe, status, timing,
+// and any error instead.
+func recordTemplateBuild(store *dashboard.Store, logger *slog.Logger, cfg *config.Config, res railway.TemplateBuildResult, buildErr error, started time.Time, instructions []string) {
+	status := string(res.Status)
+	if status == "" {
+		status = string(railway.BuildFailed)
+	}
+	b := dashboard.TemplateBuild{
+		BuildID:       res.ID,
+		RunnerVersion: cfg.RunnerVersion,
+		Recipe:        strings.Join(instructions, "\n"),
+		Status:        status,
+		Started:       started,
+		Finished:      time.Now(),
+	}
+	if buildErr != nil {
+		b.Error = buildErr.Error()
+	}
+	if _, err := store.RecordTemplateBuild(b); err != nil {
+		logger.Error("record template build", "error", err.Error())
+	}
 }
 
 func listenPort() string {

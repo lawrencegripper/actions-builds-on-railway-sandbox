@@ -26,7 +26,8 @@ See the [scale set auth docs](https://docs.github.com/en/actions/tutorials/use-a
 | `GITHUB_APP_CLIENT_ID` / `_INSTALLATION_ID` / `_PRIVATE_KEY` | `--app-*` | \* | GitHub App (preferred over a PAT) |
 | `RAILWAY_PROJECT_TOKEN` | `--railway-project-token` | \*\* | environment-scoped project token (preferred) |
 | `RAILWAY_API_TOKEN` | `--railway-token` | \*\* | account/workspace token |
-| `RAILWAY_ENVIRONMENT_ID` | `--railway-environment-id` | auto-injected | target environment (set only for local runs) |
+| `RAILWAY_ENVIRONMENT_ID` | `--railway-environment-id` | auto-injected | target environment (set only for local runs); also used to build sandbox dashboard links |
+| `RAILWAY_PROJECT_ID` | - | auto-injected | project id; used with `RAILWAY_ENVIRONMENT_ID` to link jobs to their sandbox in the Railway dashboard |
 | `RAILWAY_GRAPHQL_ENDPOINT` | `--railway-endpoint` | prod | Railway API endpoint |
 | `RUNNER_LABELS` | `--labels` | = `SCALE_SET_NAME` | comma/space-separated targeting labels |
 | `RUNNER_GROUP` | `--runner-group` | `default` | custom groups are org/enterprise-level only |

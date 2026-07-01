@@ -312,19 +312,34 @@ type templateBuild struct {
 	Status TemplateBuildStatus `json:"status"`
 }
 
+// TemplateBuildResult reports the outcome of a template build for the dashboard.
+// Railway's API exposes only the content-addressed build id and a status enum,
+// so there are no per-line build logs to capture here.
+type TemplateBuildResult struct {
+	ID     string
+	Status TemplateBuildStatus
+	Err    error
+}
+
 // BuildTemplateUntilReady pre-warms a template build so later CreateSandbox
-// calls fork from the cached build instead of building inline.
-func (c *Client) BuildTemplateUntilReady(ctx context.Context, instructions []string) error {
+// calls fork from the cached build instead of building inline. It always returns
+// a result (with the build id and last-seen status) so callers can record the
+// attempt even when it fails; err mirrors result.Err.
+func (c *Client) BuildTemplateUntilReady(ctx context.Context, instructions []string) (TemplateBuildResult, error) {
 	query := `mutation($environmentId: String!, $input: SandboxTemplateInput!){ sandboxTemplateBuild(environmentId: $environmentId, input: $input){ id status } }`
 	input := map[string]any{"instructions": instructions}
 	var data struct {
 		SandboxTemplateBuild templateBuild `json:"sandboxTemplateBuild"`
 	}
 	if err := c.do(ctx, query, map[string]any{"environmentId": c.cfg.EnvironmentID, "input": input}, &data); err != nil {
-		return err
+		return TemplateBuildResult{Status: BuildFailed, Err: err}, err
 	}
 	build := data.SandboxTemplateBuild
 	c.log.Info("template build started", slog.String("id", build.ID), slog.String("status", string(build.Status)))
+
+	fail := func(err error) (TemplateBuildResult, error) {
+		return TemplateBuildResult{ID: build.ID, Status: build.Status, Err: err}, err
+	}
 
 	statusQuery := `query($environmentId: String!, $id: ID!){ sandboxTemplateBuild(environmentId: $environmentId, id: $id){ id status } }`
 	deadline := time.Now().Add(readinessTimeout)
@@ -333,23 +348,23 @@ func (c *Client) BuildTemplateUntilReady(ctx context.Context, instructions []str
 		switch build.Status {
 		case BuildReady:
 			c.log.Info("template build ready", slog.String("id", build.ID))
-			return nil
+			return TemplateBuildResult{ID: build.ID, Status: build.Status}, nil
 		case BuildFailed:
-			return fmt.Errorf("railway: template build %s failed", build.ID)
+			return fail(fmt.Errorf("railway: template build %s failed", build.ID))
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("railway: template build %s timed out (last status %s)", build.ID, build.Status)
+			return fail(fmt.Errorf("railway: template build %s timed out (last status %s)", build.ID, build.Status))
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return fail(ctx.Err())
 		case <-time.After(delay):
 		}
 		var sd struct {
 			SandboxTemplateBuild templateBuild `json:"sandboxTemplateBuild"`
 		}
 		if err := c.do(ctx, statusQuery, map[string]any{"environmentId": c.cfg.EnvironmentID, "id": build.ID}, &sd); err != nil {
-			return err
+			return fail(err)
 		}
 		build = sd.SandboxTemplateBuild
 		delay = min(delay*2, pollMaxDelay)

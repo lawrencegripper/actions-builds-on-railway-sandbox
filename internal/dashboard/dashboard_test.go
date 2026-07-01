@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -29,9 +30,60 @@ func TestStoreAndRender(t *testing.T) {
 	defer store.Close()
 
 	// lifecycle via the sink methods
-	store.JobStarted("runner-live01")
-	store.JobStarted("runner-done01")
-	store.JobCompleted("runner-done01", "succeeded")
+	store.JobStarted("runner-live01", "sbx-live01")
+	store.JobStarted("runner-done01", "sbx-done01")
+	store.JobCompleted("runner-done01", "sbx-done01", "succeeded")
+
+	// sandbox_id round-trips through the recent-jobs query.
+	recent, err := store.recent(time.Now(), 15)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawSandbox bool
+	for _, j := range recent {
+		if j.RunnerName == "runner-done01" {
+			if j.SandboxID != "sbx-done01" {
+				t.Errorf("sandbox id = %q, want sbx-done01", j.SandboxID)
+			}
+			sawSandbox = true
+		}
+	}
+	if !sawSandbox {
+		t.Fatal("runner-done01 not found in recent jobs")
+	}
+
+	// template build recording + rollup.
+	nowB := time.Now()
+	if _, err := store.RecordTemplateBuild(TemplateBuild{
+		BuildID: "hash-ok", RunnerVersion: "2.320.0", Recipe: "apt-get update",
+		Status: "READY", Started: nowB.Add(-time.Minute), Finished: nowB,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	failID, err := store.RecordTemplateBuild(TemplateBuild{
+		BuildID: "hash-bad", RunnerVersion: "2.320.0", Recipe: "bad step",
+		Status: "FAILED", Error: "apt failed", Started: nowB.Add(-2 * time.Minute), Finished: nowB.Add(-time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	builds, err := store.TemplateBuilds(nowB, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(builds) != 2 {
+		t.Fatalf("want 2 builds, got %d", len(builds))
+	}
+	one, err := store.TemplateBuildByID(nowB, failID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if one == nil || one.Status != "FAILED" || one.Error != "apt failed" {
+		t.Fatalf("build by id = %+v", one)
+	}
+	if missing, err := store.TemplateBuildByID(nowB, 99999); err != nil || missing != nil {
+		t.Fatalf("missing build lookup = %+v, %v", missing, err)
+	}
 
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -49,9 +101,10 @@ func TestStoreAndRender(t *testing.T) {
 			start := now.AddDate(0, 0, -d).Add(-time.Duration(rng.Intn(8)) * time.Hour)
 			dur := time.Duration(20+rng.Intn(600)) * time.Second
 			res := results[rng.Intn(len(results))]
+			name := names[rng.Intn(len(names))]
 			if _, err := db.Exec(
-				`INSERT INTO jobs (runner_name, started_at, finished_at, result) VALUES (?,?,?,?)`,
-				names[rng.Intn(len(names))], start.Unix(), start.Add(dur).Unix(), res); err != nil {
+				`INSERT INTO jobs (runner_name, sandbox_id, started_at, finished_at, result) VALUES (?,?,?,?,?)`,
+				name, "sbx-"+name[7:], start.Unix(), start.Add(dur).Unix(), res); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -75,9 +128,26 @@ func TestStoreAndRender(t *testing.T) {
 		t.Fatalf("status %d", rec.Code)
 	}
 	body := rec.Body.String()
-	for _, want := range []string{"railway-runners", "Provisioning", "Recent jobs", "running", "succeeded"} {
+	for _, want := range []string{"railway-runners", "Provisioning", "Recent jobs", "running", "succeeded", "Template builds", "READY", "FAILED", "sbx-done01"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("rendered page missing %q", want)
+		}
+	}
+
+	recB := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(recB, httptest.NewRequest("GET", "/builds/"+strconv.FormatInt(failID, 10), nil))
+	if recB.Code != 200 {
+		t.Fatalf("build page status %d", recB.Code)
+	}
+	buildBody := recB.Body.String()
+	for _, want := range []string{"apt failed", "bad step", "does not expose per-line"} {
+		if !strings.Contains(buildBody, want) {
+			t.Errorf("build page missing %q", want)
+		}
+	}
+	if out := os.Getenv("BUILD_HTML_OUT"); out != "" {
+		if err := os.WriteFile(out, recB.Body.Bytes(), 0o644); err != nil {
+			t.Fatal(err)
 		}
 	}
 
