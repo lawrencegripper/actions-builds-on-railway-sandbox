@@ -50,6 +50,12 @@ func graphQLStub(t *testing.T, handler func(op string, vars map[string]any) any)
 
 func operationName(query string) string {
 	switch {
+	case strings.Contains(query, "sandboxCheckpointCreate"):
+		return "sandboxCheckpointCreate"
+	case strings.Contains(query, "sandboxCheckpointDelete"):
+		return "sandboxCheckpointDelete"
+	case strings.Contains(query, "sandboxCheckpoints"):
+		return "sandboxCheckpoints"
 	case strings.Contains(query, "sandboxCreate"):
 		return "sandboxCreate"
 	case strings.Contains(query, "sandboxDestroy"):
@@ -87,6 +93,86 @@ func TestCreateSandboxImmediateRunning(t *testing.T) {
 	}
 	if sb.ID != "sbx_1" || sb.Status != StatusRunning {
 		t.Fatalf("got %+v", sb)
+	}
+}
+
+func TestCreateSandboxFromCheckpointWithVariables(t *testing.T) {
+	var input map[string]any
+	srv := graphQLStub(t, func(op string, vars map[string]any) any {
+		if op == "sandboxCreate" {
+			input = vars["input"].(map[string]any)
+			return map[string]any{"sandboxCreate": map[string]any{"id": "sbx_checkpoint", "status": "RUNNING"}}
+		}
+		return nil
+	})
+	defer srv.Close()
+
+	c := newTestClient(t, srv.URL)
+	_, err := c.CreateSandbox(context.Background(), CreateOptions{
+		CheckpointName: "runner-base",
+		Variables:      map[string]string{"SHORT_LIVED": "value"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	template, ok := input["template"].(map[string]any)
+	if !ok || template["name"] != "runner-base" {
+		t.Fatalf("checkpoint template input = %#v", input["template"])
+	}
+	variables, ok := input["variables"].(map[string]any)
+	if !ok || variables["SHORT_LIVED"] != "value" {
+		t.Fatalf("variables input = %#v", input["variables"])
+	}
+}
+
+func TestCreateSandboxRejectsTemplateAndCheckpoint(t *testing.T) {
+	c := newTestClient(t, "http://unused.invalid")
+	_, err := c.CreateSandbox(context.Background(), CreateOptions{
+		TemplateInstructions: []string{"echo template"},
+		CheckpointName:       "checkpoint",
+	})
+	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("expected mutually exclusive error, got %v", err)
+	}
+}
+
+func TestCheckpoints(t *testing.T) {
+	var deletedID string
+	srv := graphQLStub(t, func(op string, vars map[string]any) any {
+		switch op {
+		case "sandboxCheckpointCreate":
+			if vars["sandboxId"] != "sbx_1" || vars["name"] != "runner-base" {
+				t.Errorf("create checkpoint vars = %#v", vars)
+			}
+			return map[string]any{"sandboxCheckpointCreate": map[string]any{
+				"id": "cp_1", "key": "runner-base", "environmentId": "env", "createdAt": "2026-07-26T10:00:00Z",
+			}}
+		case "sandboxCheckpoints":
+			return map[string]any{"sandboxCheckpoints": []map[string]any{
+				{"id": "cp_1", "key": "runner-base", "environmentId": "env", "createdAt": "2026-07-26T10:00:00Z"},
+			}}
+		case "sandboxCheckpointDelete":
+			deletedID, _ = vars["id"].(string)
+			return map[string]any{"sandboxCheckpointDelete": true}
+		}
+		return nil
+	})
+	defer srv.Close()
+
+	c := newTestClient(t, srv.URL)
+	cp, err := c.CreateCheckpoint(context.Background(), "sbx_1", "runner-base")
+	if err != nil || cp.ID != "cp_1" || cp.Key != "runner-base" {
+		t.Fatalf("create checkpoint = %+v, %v", cp, err)
+	}
+	checkpoints, err := c.ListCheckpoints(context.Background())
+	if err != nil || len(checkpoints) != 1 || checkpoints[0].ID != "cp_1" {
+		t.Fatalf("list checkpoints = %+v, %v", checkpoints, err)
+	}
+	if err := c.DeleteCheckpoint(context.Background(), "cp_1"); err != nil {
+		t.Fatal(err)
+	}
+	if deletedID != "cp_1" {
+		t.Fatalf("deleted id = %q", deletedID)
 	}
 }
 

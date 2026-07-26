@@ -12,7 +12,7 @@ import (
 	"github.com/actions/scaleset/listener"
 	"github.com/google/uuid"
 
-	"github.com/lawrencegripper/railway-sandbox-github-actions-runner/internal/railway"
+	"github.com/lawrencegripper/actions-builds-on-railway-sandbox/internal/railway"
 )
 
 // Provisioner is the subset of the Railway client the scaler needs (kept small

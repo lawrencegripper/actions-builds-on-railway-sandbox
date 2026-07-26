@@ -1,49 +1,96 @@
 # Configuration
 
-Every setting is available as a CLI flag or an environment variable; an explicit flag wins over its env var. On Railway you set the environment variables, and the flags are for local runs. `RAILWAY_ENVIRONMENT_ID` is auto-injected when running as a Railway service, so leave it unset there.
+The binary has three subcommands:
 
-## Credentials
+```text
+actions-builds-on-railway-sandbox github
+actions-builds-on-railway-sandbox forgejo
+actions-builds-on-railway-sandbox smoke
+```
 
-Railway, provide exactly one token:
+Flags override environment variables. Run a subcommand with `--help` for flag details.
 
-- `RAILWAY_PROJECT_TOKEN` (`--railway-project-token`): environment-scoped project token (Project Settings, Tokens). Preferred; sent via the `Project-Access-Token` header.
-- `RAILWAY_API_TOKEN` (`--railway-token`): account/workspace token (Bearer auth).
+## Shared Railway settings
 
-GitHub, provide a PAT or a GitHub App (App preferred):
+| Environment | Flag | Required | Description |
+|---|---|---:|---|
+| `RAILWAY_PROJECT_TOKEN` | `--railway-project-token` | one token | Environment-scoped project token, preferred for Railway deployments |
+| `RAILWAY_API_TOKEN` | `--railway-token` | one token | Account/workspace token |
+| `RAILWAY_ENVIRONMENT_ID` | `--railway-environment-id` | yes | Environment containing the sandboxes/checkpoints |
+| `RAILWAY_GRAPHQL_ENDPOINT` | `--railway-endpoint` | no | GraphQL endpoint override |
+| `ENABLE_PRIVATE_NETWORKING` | `--enable-private-networking` | no | Attach job sandboxes to Railway private networking |
+| `LOG_LEVEL` | `--log-level` | no | `debug`, `info`, `warn`, or `error` |
+| `LOG_FORMAT` | `--log-format` | no | `text` or `json` |
+| `PORT` | — | no | Dashboard port, default `8080` |
+| `RAILWAY_VOLUME_MOUNT_PATH` | — | no | Dashboard SQLite volume directory |
 
-- `GITHUB_TOKEN` (`--token`): personal access token.
-- `GITHUB_APP_CLIENT_ID` / `GITHUB_APP_INSTALLATION_ID` / `GITHUB_APP_PRIVATE_KEY` (`--app-client-id` / `--app-installation-id` / `--app-private-key`).
+## GitHub mode
 
-See the [scale set auth docs](https://docs.github.com/en/actions/tutorials/use-actions-runner-controller/authenticate-to-the-api) for the required permissions.
+| Environment | Flag | Required | Default |
+|---|---|---:|---|
+| `GITHUB_URL` | `--url` | yes | — |
+| `GITHUB_SCALE_SET_NAME` | `--name` | yes | — |
+| `GITHUB_RUNNER_LABELS` | `--labels` | no | scale-set name |
+| `GITHUB_RUNNER_GROUP` | `--runner-group` | no | `Default` |
+| `GITHUB_TOKEN` | `--token` | credential* | — |
+| `GITHUB_APP_CLIENT_ID` | `--app-client-id` | credential* | — |
+| `GITHUB_APP_INSTALLATION_ID` | `--app-installation-id` | credential* | — |
+| `GITHUB_APP_PRIVATE_KEY` | `--app-private-key` | credential* | — |
+| `GITHUB_MIN_RUNNERS` | `--min-runners` | no | `0` |
+| `GITHUB_MAX_RUNNERS` | `--max-runners` | no | `5` |
+| `GITHUB_RUNNER_VERSION` | `--runner-version` | no | latest |
+| `IDLE_TIMEOUT_MINUTES` | `--idle-timeout-minutes` | no | `30` |
+| `EXTRA_PACKAGES` | `--extra-packages` | no | — |
+| `EXTRA_SETUP` | `--extra-setup` | no | — |
 
-## Reference
+* Provide a PAT or all three GitHub App values. GitHub App authentication is preferred.
 
-| Env | Flag | Default | Notes |
-| --- | --- | --- | --- |
-| `GITHUB_URL` | `--url` | _(required)_ | repo/org/enterprise URL to register the scale set against |
-| `SCALE_SET_NAME` | `--name` | _(required)_ | scale set name, also the default `runs-on` label |
-| `GITHUB_TOKEN` | `--token` | \* | GitHub PAT |
-| `GITHUB_APP_CLIENT_ID` / `_INSTALLATION_ID` / `_PRIVATE_KEY` | `--app-*` | \* | GitHub App (preferred over a PAT) |
-| `RAILWAY_PROJECT_TOKEN` | `--railway-project-token` | \*\* | environment-scoped project token (preferred) |
-| `RAILWAY_API_TOKEN` | `--railway-token` | \*\* | account/workspace token |
-| `RAILWAY_ENVIRONMENT_ID` | `--railway-environment-id` | auto-injected | target environment (set only for local runs); also used to build sandbox dashboard links |
-| `RAILWAY_PROJECT_ID` | - | auto-injected | project id; used with `RAILWAY_ENVIRONMENT_ID` to link jobs to their sandbox in the Railway dashboard |
-| `RAILWAY_GRAPHQL_ENDPOINT` | `--railway-endpoint` | prod | Railway API endpoint |
-| `RUNNER_LABELS` | `--labels` | = `SCALE_SET_NAME` | comma/space-separated targeting labels |
-| `RUNNER_GROUP` | `--runner-group` | `default` | custom groups are org/enterprise-level only |
-| `MIN_RUNNERS` | `--min-runners` | `0` | pre-provisioned (warm) runners |
-| `MAX_RUNNERS` | `--max-runners` | `5` | concurrent runner cap |
-| `IDLE_TIMEOUT_MINUTES` | `--idle-timeout-minutes` | `30` | sandbox idle timeout |
-| `RUNNER_VERSION` | `--runner-version` | latest | actions runner release; pin for production |
-| `EXTRA_PACKAGES` | `--extra-packages` | - | extra apt packages baked into the image |
-| `EXTRA_SETUP` | `--extra-setup` | - | extra shell run as the final image build step |
-| `ENABLE_PRIVATE_NETWORKING` | `--enable-private-networking` | `false` | give sandboxes access to the [Railway private network](https://docs.railway.com/networking/private-networking) |
-| `LOG_LEVEL` | `--log-level` | `info` | `debug`, `info`, `warn`, `error` |
-| `LOG_FORMAT` | `--log-format` | `text` | `text` or `json` (use `json` on Railway) |
-| `PORT` | - | `8080` | dashboard HTTP port (Railway sets this automatically) |
+## Forgejo mode
 
-The dashboard records job history to SQLite at `$RAILWAY_VOLUME_MOUNT_PATH/dashboard.db` when a Railway volume is attached (`RAILWAY_VOLUME_MOUNT_PATH` is injected by the volume mount), falling back to `./data/dashboard.db` locally. Attach a volume so history survives deploys.
+### Forgejo and runner
 
-\* Provide either a PAT or the three GitHub App variables.
+| Environment | Flag | Required | Default |
+|---|---|---:|---|
+| `FORGEJO_URL` | `--forgejo-url` | yes | — |
+| `FORGEJO_API_TOKEN` | `--forgejo-token` | yes | — |
+| `FORGEJO_JOBS_URL` | `--forgejo-jobs-url` | no | `{FORGEJO_URL}/api/v1/admin/actions/runners/jobs` |
+| `FORGEJO_REGISTRATION_TOKEN_URL` | `--forgejo-registration-token-url` | no | `{FORGEJO_URL}/api/v1/admin/actions/runners/registration-token` |
+| `FORGEJO_RUNNER_LABELS` | `--runner-labels` | no | `railway-ubuntu:host` |
+| `FORGEJO_JOB_LABEL_FILTER` | `--job-label-filter` | no | label names from runner labels |
+| `FORGEJO_RUNNER_VERSION` | `--runner-version` | no | latest |
+| `POLL_INTERVAL_SECONDS` | `--poll-interval` | no | `5s` |
+| `MAX_CONCURRENT_SANDBOXES` | `--max-runners` | no | `2` |
+| `MAX_LAUNCH_PER_POLL` | `--max-launch-per-poll` | no | `2` |
+| `SANDBOX_IDLE_TIMEOUT_MINUTES` | `--sandbox-idle-timeout-minutes` | no | `10` |
+| `RUNNER_TIMEOUT_SECONDS` | `--runner-timeout` | no | `2h` |
 
-\*\* Provide exactly one Railway token.
+Duration flags use Go duration syntax; the corresponding environment variables are integer seconds/hours as named.
+
+### Forgejo checkpoints
+
+| Environment | Flag | Default |
+|---|---|---|
+| `EXTRA_PACKAGES` | `--extra-packages` | — |
+| `EXTRA_SETUP` | `--extra-setup` | — |
+| `PRELOAD_DOCKER_IMAGES` | `--preload-docker-images` | — |
+| `DOCKER_WARMUP_SETUP` | `--docker-warmup-setup` | — |
+| `SNAPSHOT_REFRESH_HOURS` | `--snapshot-refresh` | `24h` |
+| `RUNNER_SNAPSHOT_NAME_PREFIX` | `--snapshot-name-prefix` | `forgejo-runner` |
+| `SNAPSHOT_BUILD_TIMEOUT_SECONDS` | `--snapshot-build-timeout` | `30m` |
+| `RETAINED_RUNNER_SNAPSHOTS` | `--retained-snapshots` | `3` per checkpoint family |
+| `SNAPSHOT_AFTER_DEFAULT_BRANCH_BUILD` | `--snapshot-default-branch-jobs` | `true` |
+
+Hydrated checkpoints are partitioned by repository id and job name. Rebuilding the base checkpoint clears the controller's in-memory hydrated checkpoint selection, so each job family rehydrates from the fresh base.
+
+### Tailscale
+
+| Environment | Flag | Required | Default |
+|---|---|---:|---|
+| `TAILSCALE_TAILNET` | `--tailscale-tailnet` | yes | — |
+| `TAILSCALE_API_TOKEN` | `--tailscale-api-token` | credential* | — |
+| `TAILSCALE_OAUTH_CLIENT_ID` | `--tailscale-oauth-client-id` | credential* | — |
+| `TAILSCALE_OAUTH_CLIENT_SECRET` | `--tailscale-oauth-secret` | credential* | — |
+| `TAILSCALE_TAG` | `--tailscale-tag` | no | `tag:railway-forgejo-runner` |
+| `TAILSCALE_KEY_EXPIRY_SECONDS` | `--tailscale-key-expiry` | no | `10m` |
+
+* Provide an API token or both OAuth values. OAuth is preferred. The controller caches OAuth access tokens but creates a new non-reusable ephemeral device key per runner.

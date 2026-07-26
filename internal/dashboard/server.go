@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/lawrencegripper/railway-sandbox-github-actions-runner/internal/scaler"
+	"github.com/lawrencegripper/actions-builds-on-railway-sandbox/internal/scaler"
 )
 
 // Snapshotter supplies the live runner counts and configured bounds (satisfied
@@ -282,7 +282,7 @@ const pageHTML = `<!doctype html>
 </div>
 </div>
 
-<h2>Template builds</h2>
+<h2>Image builds</h2>
 <div class="card">
 {{if .Builds}}
 <table>
@@ -300,7 +300,7 @@ const pageHTML = `<!doctype html>
 </tbody>
 </table>
 {{else}}
-<div class="empty">No template builds recorded yet.</div>
+<div class="empty">No image builds recorded yet.</div>
 {{end}}
 </div>
 
@@ -308,10 +308,12 @@ const pageHTML = `<!doctype html>
 <div class="card">
 {{if .Jobs}}
 <table>
-<thead><tr><th>Runner</th><th>Sandbox</th><th>Started</th><th>Duration</th><th>Result</th></tr></thead>
+<thead><tr><th>Provider</th><th>Job</th><th>Runner</th><th>Sandbox</th><th>Started</th><th>Duration</th><th>Result</th></tr></thead>
 <tbody>
 {{range .Jobs}}
 <tr>
+<td>{{if .Provider}}{{.Provider}}{{else}}—{{end}}</td>
+<td>{{if .JobName}}{{.JobName}}{{else if .ExternalJobID}}#{{.ExternalJobID}}{{else}}—{{end}}</td>
 <td class="mono">{{.RunnerName}}</td>
 <td class="mono">
 {{if .SandboxID}}
@@ -375,7 +377,7 @@ const buildHTML = `<!doctype html>
 {{else}}<p class="note">Railway's API does not expose per-line template build logs. The SandboxTemplateBuild resource carries only a content-addressed id and a status; there is no logs field or a deployment id to query buildLogs against. Status, the error above, the recipe, and timing are recorded instead.</p>{{end}}
 </div>
 
-<footer>railway-sandbox-actions</footer>
+<footer>actions-builds-on-railway-sandbox</footer>
 </div>
 </body>
 </html>`

@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lawrencegripper/railway-sandbox-github-actions-runner/internal/scaler"
+	"github.com/lawrencegripper/actions-builds-on-railway-sandbox/internal/scaler"
 )
 
 type fakeSnap struct{}
@@ -33,6 +33,8 @@ func TestStoreAndRender(t *testing.T) {
 	store.JobStarted("runner-live01", "sbx-live01")
 	store.JobStarted("runner-done01", "sbx-done01")
 	store.JobCompleted("runner-done01", "sbx-done01", "succeeded")
+	store.ProviderJobStarted("forgejo", "77", "build", "42", "forgejo-runner", "sbx-forgejo")
+	store.ProviderJobCompleted("forgejo", "77", "forgejo-runner", "sbx-forgejo", "succeeded")
 
 	// sandbox_id round-trips through the recent-jobs query.
 	recent, err := store.recent(time.Now(), 15)
@@ -128,7 +130,7 @@ func TestStoreAndRender(t *testing.T) {
 		t.Fatalf("status %d", rec.Code)
 	}
 	body := rec.Body.String()
-	for _, want := range []string{"railway-runners", "Provisioning", "Recent jobs", "running", "succeeded", "Template builds", "READY", "FAILED", "sbx-done01"} {
+	for _, want := range []string{"railway-runners", "Provisioning", "Recent jobs", "running", "succeeded", "Image builds", "READY", "FAILED", "forgejo", "build", "sbx-done01"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("rendered page missing %q", want)
 		}

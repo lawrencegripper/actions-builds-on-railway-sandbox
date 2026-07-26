@@ -11,7 +11,7 @@ import (
 
 	"github.com/actions/scaleset"
 
-	"github.com/lawrencegripper/railway-sandbox-github-actions-runner/internal/railway"
+	"github.com/lawrencegripper/actions-builds-on-railway-sandbox/internal/railway"
 )
 
 type fakeProvisioner struct {

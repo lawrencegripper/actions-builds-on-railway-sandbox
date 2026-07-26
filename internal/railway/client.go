@@ -205,16 +205,25 @@ func truncate(b []byte) string {
 type CreateOptions struct {
 	IdleTimeoutMinutes int
 	NetworkIsolation   NetworkIsolation
+	// Variables are runtime environment variables attached to the sandbox. Do not
+	// log their values; they may contain short-lived runner credentials.
+	Variables map[string]string
 	// TemplateInstructions builds (or reuses a cached build of) a template from
 	// these shell instructions before booting. The backend content-addresses
 	// the build, so passing identical instructions reuses the cache.
 	TemplateInstructions []string
+	// CheckpointName boots from a named checkpoint. It is mutually exclusive with
+	// TemplateInstructions.
+	CheckpointName string
 }
 
 const sandboxFields = `id status networkIsolation environmentId region idleTimeoutMinutes createdAt`
 
 // CreateSandbox creates a sandbox and waits until it is RUNNING.
 func (c *Client) CreateSandbox(ctx context.Context, opts CreateOptions) (*Sandbox, error) {
+	if len(opts.TemplateInstructions) > 0 && opts.CheckpointName != "" {
+		return nil, fmt.Errorf("railway: template instructions and checkpoint name are mutually exclusive")
+	}
 	input := map[string]any{"environmentId": c.cfg.EnvironmentID}
 	if opts.IdleTimeoutMinutes > 0 {
 		input["idleTimeoutMinutes"] = opts.IdleTimeoutMinutes
@@ -222,8 +231,14 @@ func (c *Client) CreateSandbox(ctx context.Context, opts CreateOptions) (*Sandbo
 	if opts.NetworkIsolation != "" {
 		input["networkIsolation"] = opts.NetworkIsolation
 	}
+	if len(opts.Variables) > 0 {
+		input["variables"] = opts.Variables
+	}
 	if len(opts.TemplateInstructions) > 0 {
 		input["template"] = map[string]any{"instructions": opts.TemplateInstructions}
+	}
+	if opts.CheckpointName != "" {
+		input["template"] = map[string]any{"name": opts.CheckpointName}
 	}
 
 	query := `mutation($input: SandboxCreateInput!){ sandboxCreate(input: $input){ ` + sandboxFields + ` } }`
@@ -296,6 +311,49 @@ func (c *Client) GetSandbox(ctx context.Context, id string) (*Sandbox, error) {
 func (c *Client) DestroySandbox(ctx context.Context, id string) error {
 	query := `mutation($id: String!, $environmentId: String!){ sandboxDestroy(id: $id, environmentId: $environmentId){ id status } }`
 	return c.do(ctx, query, map[string]any{"id": id, "environmentId": c.cfg.EnvironmentID}, nil)
+}
+
+// Checkpoint is a named, bootable disk snapshot stored in a Railway environment.
+type Checkpoint struct {
+	ID            string `json:"id"`
+	Key           string `json:"key"`
+	EnvironmentID string `json:"environmentId"`
+	CreatedAt     string `json:"createdAt"`
+}
+
+const checkpointFields = `id key environmentId createdAt`
+
+// CreateCheckpoint captures a running sandbox. The backend call is synchronous:
+// the checkpoint is bootable when it returns.
+func (c *Client) CreateCheckpoint(ctx context.Context, sandboxID, name string) (*Checkpoint, error) {
+	query := `mutation($environmentId: String!, $name: String!, $sandboxId: String!){ sandboxCheckpointCreate(environmentId: $environmentId, name: $name, sandboxId: $sandboxId){ ` + checkpointFields + ` } }`
+	var data struct {
+		Checkpoint Checkpoint `json:"sandboxCheckpointCreate"`
+	}
+	vars := map[string]any{"environmentId": c.cfg.EnvironmentID, "name": name, "sandboxId": sandboxID}
+	if err := c.do(ctx, query, vars, &data); err != nil {
+		return nil, err
+	}
+	c.log.Info("sandbox checkpoint created", slog.String("sandbox", sandboxID), slog.String("checkpoint", name), slog.String("id", data.Checkpoint.ID))
+	return &data.Checkpoint, nil
+}
+
+// ListCheckpoints lists all named checkpoints in the environment.
+func (c *Client) ListCheckpoints(ctx context.Context) ([]Checkpoint, error) {
+	query := `query($environmentId: String!){ sandboxCheckpoints(environmentId: $environmentId){ ` + checkpointFields + ` } }`
+	var data struct {
+		Checkpoints []Checkpoint `json:"sandboxCheckpoints"`
+	}
+	if err := c.do(ctx, query, map[string]any{"environmentId": c.cfg.EnvironmentID}, &data); err != nil {
+		return nil, err
+	}
+	return data.Checkpoints, nil
+}
+
+// DeleteCheckpoint deletes a checkpoint and its underlying disk snapshot by id.
+func (c *Client) DeleteCheckpoint(ctx context.Context, id string) error {
+	query := `mutation($environmentId: String!, $id: ID!){ sandboxCheckpointDelete(environmentId: $environmentId, id: $id) }`
+	return c.do(ctx, query, map[string]any{"environmentId": c.cfg.EnvironmentID, "id": id}, nil)
 }
 
 type TemplateBuildStatus string

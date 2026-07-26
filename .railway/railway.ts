@@ -1,4 +1,4 @@
-// Railway Infrastructure-as-Code for railway-sandbox-github-actions-runner.
+// Railway Infrastructure-as-Code for actions-builds-on-railway-sandbox.
 //
 // Defines the whole project: the runner/orchestrator service (built from this
 // repo's Dockerfile), a volume for the dashboard's SQLite database, and the
@@ -16,14 +16,14 @@
 
 import { defineRailway, service, volume, github } from "railway";
 
-const REPO = "lawrencegripper/railway-sandbox-github-actions-runner";
+const REPO = "lawrencegripper/actions-builds-on-railway-sandbox";
 
 export default defineRailway((_ctx, project) => {
   // Persists the dashboard's SQLite database across deploys. Mounted at /data,
   // which the service reads via RAILWAY_VOLUME_MOUNT_PATH.
   const data = volume("runner-data", { sizeMB: 1024 });
 
-  const runner = service("railway-github-runner", {
+  const runner = service("actions-builds-on-railway-sandbox", {
     source: github(REPO),
     volumeMounts: { "runner-data": { mountPath: "/data" } },
     deploy: { restartPolicyType: "ON_FAILURE", restartPolicyMaxRetries: 10 },
@@ -36,8 +36,8 @@ export default defineRailway((_ctx, project) => {
       },
       // Where to register the scale set, e.g. https://github.com/you/repo.
       GITHUB_URL: { description: "GitHub repo/org/enterprise URL", isOptional: false },
-      SCALE_SET_NAME: {
-        description: "Scale set name, also the default runs-on label",
+      GITHUB_SCALE_SET_NAME: {
+        description: "GitHub scale set name, also the default runs-on label",
         defaultValue: "railway-runners",
         isOptional: false,
       },
@@ -47,11 +47,11 @@ export default defineRailway((_ctx, project) => {
       GITHUB_APP_INSTALLATION_ID: { description: "GitHub App installation id", isOptional: true },
       GITHUB_APP_PRIVATE_KEY: { description: "GitHub App private key (PEM)", isSealed: true, isOptional: true },
       // Optional tuning; see docs/configuration.md for the full set.
-      MAX_RUNNERS: { description: "Max concurrent runners", defaultValue: "5", isOptional: true },
-      RUNNER_VERSION: { description: "Actions runner version; defaults to the latest release", isOptional: true },
+      GITHUB_MAX_RUNNERS: { description: "Max concurrent GitHub runners", defaultValue: "5", isOptional: true },
+      GITHUB_RUNNER_VERSION: { description: "Actions runner version; defaults to the latest release", isOptional: true },
       LOG_FORMAT: "json",
     },
   });
 
-  return project("railway-github-runner", { resources: [data, runner] });
+  return project("actions-builds-on-railway-sandbox", { resources: [data, runner] });
 });

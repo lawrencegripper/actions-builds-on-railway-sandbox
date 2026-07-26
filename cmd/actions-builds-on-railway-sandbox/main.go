@@ -1,4 +1,4 @@
-// Command railway-sandbox-actions runs GitHub Actions jobs as ephemeral runners
+// Command actions-builds-on-railway-sandbox runs GitHub Actions jobs as ephemeral runners
 // inside Railway sandboxes, driven by the GitHub Actions runner scale set API.
 package main
 
@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/actions/scaleset"
@@ -18,10 +19,10 @@ import (
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 
-	"github.com/lawrencegripper/railway-sandbox-github-actions-runner/internal/config"
-	"github.com/lawrencegripper/railway-sandbox-github-actions-runner/internal/dashboard"
-	"github.com/lawrencegripper/railway-sandbox-github-actions-runner/internal/railway"
-	"github.com/lawrencegripper/railway-sandbox-github-actions-runner/internal/scaler"
+	"github.com/lawrencegripper/actions-builds-on-railway-sandbox/internal/config"
+	"github.com/lawrencegripper/actions-builds-on-railway-sandbox/internal/dashboard"
+	"github.com/lawrencegripper/actions-builds-on-railway-sandbox/internal/railway"
+	"github.com/lawrencegripper/actions-builds-on-railway-sandbox/internal/scaler"
 )
 
 func main() {
@@ -34,51 +35,55 @@ func main() {
 func rootCmd() *cobra.Command {
 	cfg := &config.Config{}
 	cmd := &cobra.Command{
-		Use:   "railway-sandbox-actions",
-		Short: "Run GitHub Actions runners as ephemeral Railway sandboxes via the scale set API",
+		Use:   "actions-builds-on-railway-sandbox",
+		Short: "Run GitHub or Forgejo Actions builds in ephemeral Railway sandboxes",
+	}
+
+	p := cmd.PersistentFlags()
+	p.StringVar(&cfg.RailwayToken, "railway-token", "", "Railway account/workspace token (or RAILWAY_API_TOKEN)")
+	p.StringVar(&cfg.RailwayProjectToken, "railway-project-token", "", "Railway project token, environment-scoped (or RAILWAY_PROJECT_TOKEN)")
+	p.StringVar(&cfg.RailwayEnvironmentID, "railway-environment-id", "", "Railway environment id (or RAILWAY_ENVIRONMENT_ID)")
+	p.StringVar(&cfg.RailwayEndpoint, "railway-endpoint", "", "Railway GraphQL endpoint (or RAILWAY_GRAPHQL_ENDPOINT)")
+	p.BoolVar(&cfg.EnablePrivateNetworking, "enable-private-networking", false, "give sandboxes access to the Railway private network")
+	p.StringVar(&cfg.LogLevel, "log-level", "info", "log level: debug, info, warn, error")
+	p.StringVar(&cfg.LogFormat, "log-format", "text", "log format: text or json")
+
+	cmd.AddCommand(githubCmd(cfg), forgejoCmd(cfg), smokeCmd(cfg))
+	return cmd
+}
+
+func githubCmd(cfg *config.Config) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "github",
+		Short: "Run GitHub Actions via the runner scale-set protocol",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if err := cfg.ApplyEnv(cmd.Flags().Changed); err != nil {
 				return err
 			}
-			ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt)
+			ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer cancel()
-			return run(ctx, cfg)
+			return runGitHub(ctx, cfg)
 		},
 	}
-
-	// Flags shared with subcommands (e.g. smoke) live on PersistentFlags.
-	p := cmd.PersistentFlags()
-	p.StringVar(&cfg.RailwayToken, "railway-token", "", "Railway account/workspace token (or RAILWAY_API_TOKEN)")
-	p.StringVar(&cfg.RailwayProjectToken, "railway-project-token", "", "Railway project token, environment-scoped (or RAILWAY_PROJECT_TOKEN)")
-	p.StringVar(&cfg.RailwayEnvironmentID, "railway-environment-id", "", "Railway environment id (or RAILWAY_ENVIRONMENT_ID, auto-injected on Railway)")
-	p.StringVar(&cfg.RailwayEndpoint, "railway-endpoint", "", "Railway GraphQL endpoint (or RAILWAY_GRAPHQL_ENDPOINT)")
-	p.BoolVar(&cfg.EnablePrivateNetworking, "enable-private-networking", false, "give sandboxes access to the Railway private network (https://docs.railway.com/networking/private-networking)")
-	p.StringVar(&cfg.LogLevel, "log-level", "info", "log level: debug, info, warn, error")
-	p.StringVar(&cfg.LogFormat, "log-format", "text", "log format: text or json")
-
 	f := cmd.Flags()
-	f.StringVar(&cfg.RegistrationURL, "url", "", "where to register the scale set (or GITHUB_URL), e.g. https://github.com/org/repo")
-	f.StringVar(&cfg.ScaleSetName, "name", "", "scale set name, also the default runs-on label (or SCALE_SET_NAME)")
+	f.StringVar(&cfg.RegistrationURL, "url", "", "GitHub repo/org/enterprise URL (or GITHUB_URL)")
+	f.StringVar(&cfg.ScaleSetName, "name", "", "scale-set name and default runs-on label (or GITHUB_SCALE_SET_NAME)")
 	f.StringSliceVar(&cfg.Labels, "labels", nil, "labels for workflow targeting (defaults to --name)")
 	f.StringVar(&cfg.RunnerGroup, "runner-group", scaleset.DefaultRunnerGroup, "runner group name")
-	f.IntVar(&cfg.MinRunners, "min-runners", 0, "minimum (pre-provisioned) runners")
+	f.IntVar(&cfg.MinRunners, "min-runners", 0, "minimum pre-provisioned runners")
 	f.IntVar(&cfg.MaxRunners, "max-runners", 5, "maximum concurrent runners")
-
 	f.StringVar(&cfg.GitHubApp.ClientID, "app-client-id", "", "GitHub App client id")
 	f.Int64Var(&cfg.GitHubApp.InstallationID, "app-installation-id", 0, "GitHub App installation id")
 	f.StringVar(&cfg.GitHubApp.PrivateKey, "app-private-key", "", "GitHub App private key (PEM)")
 	f.StringVar(&cfg.Token, "token", "", "GitHub PAT (alternative to a GitHub App)")
-
 	f.IntVar(&cfg.IdleTimeoutMinutes, "idle-timeout-minutes", 30, "sandbox idle timeout")
-	f.StringVar(&cfg.RunnerVersion, "runner-version", "", "actions runner version (default: latest release)")
+	f.StringVar(&cfg.RunnerVersion, "runner-version", "", "GitHub Actions runner version (default: latest)")
 	f.StringSliceVar(&cfg.ExtraPackages, "extra-packages", nil, "extra apt packages to bake into the runner image")
 	f.StringVar(&cfg.ExtraSetup, "extra-setup", "", "extra shell run as the final image build step")
-
-	cmd.AddCommand(smokeCmd(cfg))
 	return cmd
 }
 
-func run(ctx context.Context, cfg *config.Config) error {
+func runGitHub(ctx context.Context, cfg *config.Config) error {
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
