@@ -110,6 +110,8 @@ railway config apply
 
 A Forgejo controller can use the same image outside Railway, for example from the homenet k3s deployment, with the container argument overridden to `forgejo`.
 
+Every push to `main` and every `v*` tag runs lint, tests, and a static build before publishing the image to [`ghcr.io/lawrencegripper/actions-builds-on-railway-sandbox`](https://github.com/lawrencegripper/actions-builds-on-railway-sandbox/pkgs/container/actions-builds-on-railway-sandbox). Main publishes `latest` and `sha-*`; version tags also publish the tag.
+
 ## Smoke test
 
 Test Railway create/exec/destroy without either Actions provider:
