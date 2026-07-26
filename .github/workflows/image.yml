@@ -1,4 +1,4 @@
-name: Container image
+name: Test and publish container
 
 on:
   push:
@@ -11,7 +11,25 @@ permissions:
   packages: write
 
 jobs:
+  validate:
+    name: Lint and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Lint
+        run: make lint
+      - name: Test
+        run: make test
+      - name: Verify static build
+        run: make static
+
   publish:
+    name: Build and publish GHCR image
+    needs: validate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -24,11 +42,14 @@ jobs:
       - uses: docker/metadata-action@v5
         id: meta
         with:
-          images: ghcr.io/lawrencegripper/actions-builds-on-railway-sandbox
+          images: ghcr.io/${{ github.repository }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=tag
             type=sha
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
       - uses: docker/build-push-action@v6
         with:
           context: .
