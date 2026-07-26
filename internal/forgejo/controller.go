@@ -15,7 +15,7 @@ import (
 type ForgejoService interface {
 	WaitingJobs(context.Context) ([]Job, error)
 	RegistrationToken(context.Context) (string, error)
-	ShouldHydrate(context.Context, Job, time.Time) (bool, error)
+	Completion(context.Context, Job, time.Time) (JobCompletion, error)
 }
 
 type AuthKeyIssuer interface {
@@ -194,28 +194,29 @@ func (c *Controller) runOne(ctx context.Context, job Job, sequence uint64, snaps
 		"SHELL":                             "/bin/bash",
 	}})
 	cancel()
-	outcome := "failed"
-	if execErr == nil && result.ExitCode == 0 {
-		outcome = "succeeded"
-	} else if runCtx.Err() == context.DeadlineExceeded {
-		outcome = "timed_out"
-	}
-	c.sink.ProviderJobCompleted("forgejo", externalID, runnerName, sandbox.ID, outcome)
 	if execErr != nil {
+		outcome := "failed"
+		if runCtx.Err() == context.DeadlineExceeded {
+			outcome = "timed_out"
+		}
+		c.sink.ProviderJobCompleted("forgejo", externalID, runnerName, sandbox.ID, outcome)
 		c.logger.Error("Forgejo runner exec", "runner", runnerName, "sandbox", sandbox.ID, "error", execErr)
 		return RunnerImage{}, false
 	}
 	c.logger.Info("Forgejo runner finished", "runner", runnerName, "sandbox", sandbox.ID, "exitCode", result.ExitCode)
 	if result.ExitCode != 0 {
+		c.sink.ProviderJobCompleted("forgejo", externalID, runnerName, sandbox.ID, "failed")
 		return RunnerImage{}, false
 	}
 
-	eligible, err := c.api.ShouldHydrate(context.WithoutCancel(ctx), job, started)
+	completion, err := c.api.Completion(context.WithoutCancel(ctx), job, started)
 	if err != nil {
-		c.logger.Warn("check Forgejo checkpoint eligibility", "jobId", job.ID, "error", err)
+		c.logger.Warn("match Forgejo job completion", "jobId", job.ID, "error", err)
+		c.sink.ProviderJobCompleted("forgejo", externalID, runnerName, sandbox.ID, "unknown")
 		return RunnerImage{}, false
 	}
-	if !eligible {
+	c.sink.ProviderJobCompleted("forgejo", externalID, runnerName, sandbox.ID, completion.Outcome)
+	if !completion.Hydrate {
 		return RunnerImage{}, false
 	}
 	hydrateCtx, hydrateCancel := context.WithTimeout(context.WithoutCancel(ctx), c.cfg.SnapshotBuildTimeout)

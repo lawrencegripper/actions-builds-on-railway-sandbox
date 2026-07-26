@@ -165,21 +165,25 @@ func (a *API) ActionTasks(ctx context.Context, repository Repository) ([]ActionT
 	return response.WorkflowRuns, nil
 }
 
-// ShouldHydrate determines whether a successfully completed runner represented
-// a job on the repository default branch. Forgejo does not expose a direct job
-// claim/completion correlation here, so this preserves the existing scaler's
-// best-effort match by recent timestamp and job name.
-func (a *API) ShouldHydrate(ctx context.Context, job Job, runnerStarted time.Time) (bool, error) {
-	if !a.cfg.SnapshotDefaultBranchJobs || job.RepoID == 0 {
-		return false, nil
+type JobCompletion struct {
+	Outcome string
+	Hydrate bool
+}
+
+// Completion finds the task most likely claimed by a completed one-job runner.
+// Forgejo does not expose a direct claim correlation here, so this preserves the
+// existing scaler's best-effort match by recent timestamp and job name.
+func (a *API) Completion(ctx context.Context, job Job, runnerStarted time.Time) (JobCompletion, error) {
+	if job.RepoID == 0 {
+		return JobCompletion{Outcome: "unknown"}, nil
 	}
 	repository, err := a.Repository(ctx, job.RepoID)
 	if err != nil {
-		return false, err
+		return JobCompletion{}, err
 	}
 	tasks, err := a.ActionTasks(ctx, repository)
 	if err != nil {
-		return false, err
+		return JobCompletion{}, err
 	}
 	cutoff := runnerStarted.Add(-5 * time.Minute)
 	sort.SliceStable(tasks, func(i, j int) bool { return taskTime(tasks[i]).After(taskTime(tasks[j])) })
@@ -202,21 +206,32 @@ func (a *API) ShouldHydrate(ctx context.Context, job Job, runnerStarted time.Tim
 	if selected == nil && len(tasks) > 0 {
 		selected = &tasks[0]
 	}
-	if selected == nil || repository.DefaultBranch == "" {
-		return false, nil
+	if selected == nil {
+		return JobCompletion{Outcome: "unknown"}, nil
 	}
 	branch := strings.TrimPrefix(strings.TrimPrefix(selected.HeadBranch, "refs/heads/"), "heads/")
-	succeeded := selected.Status == "success" || selected.Status == "succeeded"
-	a.logger.Info("checked Forgejo snapshot eligibility",
+	outcome := selected.Status
+	switch outcome {
+	case "success":
+		outcome = "succeeded"
+	case "failure":
+		outcome = "failed"
+	}
+	if outcome == "" {
+		outcome = "unknown"
+	}
+	hydrate := a.cfg.SnapshotDefaultBranchJobs && outcome == "succeeded" && repository.DefaultBranch != "" && branch == repository.DefaultBranch
+	a.logger.Info("matched Forgejo job completion",
 		"jobId", job.ID,
 		"repoId", job.RepoID,
 		"taskId", selected.ID,
 		"taskStatus", selected.Status,
 		"branch", branch,
 		"defaultBranch", repository.DefaultBranch,
-		"eligible", succeeded && branch == repository.DefaultBranch,
+		"outcome", outcome,
+		"hydrate", hydrate,
 	)
-	return succeeded && branch == repository.DefaultBranch, nil
+	return JobCompletion{Outcome: outcome, Hydrate: hydrate}, nil
 }
 
 func taskTime(task ActionTask) time.Time {
