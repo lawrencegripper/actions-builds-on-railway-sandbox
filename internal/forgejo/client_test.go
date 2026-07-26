@@ -53,7 +53,7 @@ func TestAPIWaitingJobsAndRegistrationToken(t *testing.T) {
 	}
 }
 
-func TestAPIShouldHydrateDefaultBranchJob(t *testing.T) {
+func TestAPICompletionHydratesSuccessfulDefaultBranchJob(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -72,12 +72,12 @@ func TestAPIShouldHydrateDefaultBranchJob(t *testing.T) {
 	defer server.Close()
 	cfg := Config{URL: server.URL, APIToken: "secret", SnapshotDefaultBranchJobs: true}
 	api := NewAPI(cfg, server.Client(), nil)
-	got, err := api.ShouldHydrate(context.Background(), Job{ID: 7, RepoID: 42, Name: "build"}, now.Add(-time.Minute))
+	got, err := api.Completion(context.Background(), Job{ID: 7, RepoID: 42, Name: "build"}, now.Add(-time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !got {
-		t.Fatal("expected default branch job to be eligible")
+	if !got.Hydrate || got.Outcome != "succeeded" {
+		t.Fatalf("completion = %+v, want successful hydration", got)
 	}
 }
 
@@ -100,12 +100,12 @@ func TestAPIDoesNotHydrateFailedDefaultBranchJob(t *testing.T) {
 	defer server.Close()
 	cfg := Config{URL: server.URL, APIToken: "secret", SnapshotDefaultBranchJobs: true}
 	api := NewAPI(cfg, server.Client(), nil)
-	got, err := api.ShouldHydrate(context.Background(), Job{ID: 7, RepoID: 42, Name: "build"}, now.Add(-time.Minute))
+	got, err := api.Completion(context.Background(), Job{ID: 7, RepoID: 42, Name: "build"}, now.Add(-time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got {
-		t.Fatal("failed workflow must not hydrate a checkpoint")
+	if got.Hydrate || got.Outcome != "failed" {
+		t.Fatalf("completion = %+v, failed workflow must not hydrate", got)
 	}
 }
 

@@ -19,8 +19,8 @@ func (f *fakeForgejoAPI) WaitingJobs(context.Context) ([]Job, error) {
 func (f *fakeForgejoAPI) RegistrationToken(context.Context) (string, error) {
 	return "registration-short", nil
 }
-func (f *fakeForgejoAPI) ShouldHydrate(context.Context, Job, time.Time) (bool, error) {
-	return false, nil
+func (f *fakeForgejoAPI) Completion(context.Context, Job, time.Time) (JobCompletion, error) {
+	return JobCompletion{Outcome: "succeeded"}, nil
 }
 
 type fakeKeys struct{}
@@ -38,6 +38,7 @@ type fakeProviderSink struct {
 	mu        sync.Mutex
 	started   int
 	completed int
+	outcome   string
 }
 
 func (f *fakeProviderSink) ProviderJobStarted(string, string, string, string, string, string) {
@@ -45,10 +46,11 @@ func (f *fakeProviderSink) ProviderJobStarted(string, string, string, string, st
 	defer f.mu.Unlock()
 	f.started++
 }
-func (f *fakeProviderSink) ProviderJobCompleted(string, string, string, string, string) {
+func (f *fakeProviderSink) ProviderJobCompleted(_, _, _, _, outcome string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.completed++
+	f.outcome = outcome
 }
 
 func TestControllerDeduplicatesQueuedJobAndKeepsSecretsOutOfCreate(t *testing.T) {
@@ -107,5 +109,8 @@ func TestControllerDeduplicatesQueuedJobAndKeepsSecretsOutOfCreate(t *testing.T)
 	}
 	if controller.Snapshot().Total() != 0 {
 		t.Fatalf("counts after completion = %+v", controller.Snapshot())
+	}
+	if sink.outcome != "succeeded" {
+		t.Fatalf("dashboard outcome = %q", sink.outcome)
 	}
 }
