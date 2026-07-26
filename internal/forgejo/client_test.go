@@ -63,7 +63,7 @@ func TestAPIShouldHydrateDefaultBranchJob(t *testing.T) {
 			})
 		case "/api/v1/repos/owner/repo/actions/tasks":
 			_ = json.NewEncoder(w).Encode(map[string]any{"workflow_runs": []map[string]any{
-				{"id": 9, "name": "build", "head_branch": "refs/heads/main", "updated_at": now.Format(time.RFC3339)},
+				{"id": 9, "name": "build", "head_branch": "refs/heads/main", "status": "success", "updated_at": now.Format(time.RFC3339)},
 			}})
 		default:
 			http.NotFound(w, r)
@@ -78,6 +78,34 @@ func TestAPIShouldHydrateDefaultBranchJob(t *testing.T) {
 	}
 	if !got {
 		t.Fatal("expected default branch job to be eligible")
+	}
+}
+
+func TestAPIDoesNotHydrateFailedDefaultBranchJob(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/repositories/42":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"full_name": "owner/repo", "default_branch": "main",
+			})
+		case "/api/v1/repos/owner/repo/actions/tasks":
+			_ = json.NewEncoder(w).Encode(map[string]any{"workflow_runs": []map[string]any{
+				{"id": 9, "name": "build", "head_branch": "main", "status": "failure", "updated_at": now.Format(time.RFC3339)},
+			}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	cfg := Config{URL: server.URL, APIToken: "secret", SnapshotDefaultBranchJobs: true}
+	api := NewAPI(cfg, server.Client(), nil)
+	got, err := api.ShouldHydrate(context.Background(), Job{ID: 7, RepoID: 42, Name: "build"}, now.Add(-time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got {
+		t.Fatal("failed workflow must not hydrate a checkpoint")
 	}
 }
 

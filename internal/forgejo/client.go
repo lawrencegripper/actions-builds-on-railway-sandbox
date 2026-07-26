@@ -206,14 +206,17 @@ func (a *API) ShouldHydrate(ctx context.Context, job Job, runnerStarted time.Tim
 		return false, nil
 	}
 	branch := strings.TrimPrefix(strings.TrimPrefix(selected.HeadBranch, "refs/heads/"), "heads/")
+	succeeded := selected.Status == "success" || selected.Status == "succeeded"
 	a.logger.Info("checked Forgejo snapshot eligibility",
 		"jobId", job.ID,
 		"repoId", job.RepoID,
 		"taskId", selected.ID,
+		"taskStatus", selected.Status,
 		"branch", branch,
 		"defaultBranch", repository.DefaultBranch,
+		"eligible", succeeded && branch == repository.DefaultBranch,
 	)
-	return branch == repository.DefaultBranch, nil
+	return succeeded && branch == repository.DefaultBranch, nil
 }
 
 func taskTime(task ActionTask) time.Time {
