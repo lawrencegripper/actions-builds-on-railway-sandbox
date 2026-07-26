@@ -1,110 +1,149 @@
-# railway-sandbox-actions
+# actions-builds-on-railway-sandbox
 
-Run GitHub Actions jobs as ephemeral [Railway sandboxes](https://docs.railway.com), driven by the GitHub Actions [runner scale set](https://github.com/actions/scaleset) API.
+Run GitHub Actions or Forgejo Actions builds in fresh, ephemeral [Railway sandboxes](https://docs.railway.com/sandboxes). Each runner handles one job and its sandbox is then destroyed.
 
-Each job gets its own fresh sandbox. The service registers a scale set with GitHub, listens for scaling signals, provisions a sandbox per assigned job, runs the actions runner inside it for one job, and destroys the sandbox when the job finishes. No Kubernetes, no `actions-runner-controller`.
+Railway bills sandbox CPU and memory by actual usage. There is no idle runner VM pool and no Kubernetes dependency such as `actions-runner-controller`.
 
-Railway [bills by usage](https://docs.railway.com/reference/pricing/understanding-your-bill): the CPU and memory a workload actually consumes, not capacity you reserve. A sandbox only exists for the length of a job, so there is no idle cost between jobs. A job that spends its time waiting, blocked on I/O or sitting on a `sleep`, costs next to nothing while it waits, where an always-on runner pool bills whether or not it is working. Sandboxes run on Railway's fast CPUs, which helps build-heavy jobs.
+## Providers
 
-## How it works
+### GitHub
 
-```
-GitHub Actions  ──scale set API──▶  this service  ──GraphQL──▶  Railway
-   (job queued)                     (listener)                  (sandbox create)
-                                         │
-                                         ├─ GenerateJitRunnerConfig (per job)
-                                         ├─ CreateSandbox (runner template)
-                                         ├─ exec ./run.sh  (ws /ws/exec, JIT config in env)
-                                         └─ DestroySandbox (on JobCompleted)
+GitHub mode uses the official [`actions/scaleset`](https://github.com/actions/scaleset) Go client. The service creates a runner scale set, consumes desired-capacity and lifecycle messages, mints a JIT runner config, and starts one sandbox per runner.
+
+```text
+GitHub scale-set API ──▶ GitHub controller ──▶ Railway template sandbox
+                                │                       │
+                                └── JIT config ─────────┘
 ```
 
-- The [`actions/scaleset`](https://github.com/actions/scaleset) Go client handles the GitHub-side protocol: GitHub App / PAT auth and token refresh, scale-set CRUD, the long-poll message session, and JIT runner configs.
-- `internal/railway` is a Go port of the official [TypeScript SDK](https://www.npmjs.com/package/railway): sandbox create/get/destroy, template builds, shell-token minting, and the `/ws/exec` WebSocket bridge.
-- `internal/scaler` implements `listener.Scaler`. It maps `statistics.TotalAssignedJobs` to a target runner count and provisions or destroys sandboxes to match.
+### Forgejo
 
-The runner starts with `ACTIONS_RUNNER_INPUT_JITCONFIG` in its environment, so `run.sh` registers just-in-time, runs one job, and exits.
+Forgejo mode polls the Forgejo 15+ admin runner-job endpoint. For each waiting job it mints a one-job registration token and an ephemeral Tailscale key, then starts a runner from a Railway checkpoint.
+
+```text
+Forgejo admin API ──▶ Forgejo controller ──▶ Railway checkpoint sandbox
+       ▲                       │                        │
+       └── one-job runner over Tailscale ──────────────┘
+```
+
+Forgejo base checkpoints can preload public Docker images. After a successful default-branch job, the controller can scrub the runner state and save a checkpoint partitioned by repository and job name, preserving Docker layers/build cache for the next build.
 
 ## Build
 
 ```bash
-go build ./cmd/railway-sandbox-actions
+go build ./cmd/actions-builds-on-railway-sandbox
 ```
 
-## Run
+## Run GitHub mode
 
 ```bash
-railway-sandbox-actions \
+actions-builds-on-railway-sandbox github \
   --url https://github.com/my-org/my-repo \
   --name railway-runners \
   --max-runners 5 \
-  --token "$GITHUB_PAT"
+  --token "$GITHUB_TOKEN"
 ```
 
-Then target it from a workflow:
+Use the scale-set name or configured label in a workflow:
 
 ```yaml
 jobs:
   build:
-    runs-on: railway-runners   # the --name value (or a --labels entry)
+    runs-on: railway-runners
 ```
 
-All flags and environment variables are in [docs/configuration.md](docs/configuration.md).
+GitHub runner images use Railway's content-addressed template builds. The image includes the Actions runner, Docker, and a normal build toolchain.
 
-## Deploy on Railway
+## Run Forgejo mode
 
-The repo ships a `Dockerfile` (multi-stage, static binary on distroless) and a `railway.json`, and is configured entirely through environment variables. It serves a small status dashboard on `PORT` (see below), so attach a volume to persist the dashboard history across deploys.
+The Forgejo controller needs Railway, Forgejo admin API, and Tailscale OAuth credentials. Long-lived credentials remain in the controller; sandboxes receive only short-lived registration and Tailscale keys through the exec environment.
 
 ```bash
-railway up
+export RAILWAY_API_TOKEN=...
+export RAILWAY_ENVIRONMENT_ID=...
+export FORGEJO_URL=https://forgejo.example.com
+export FORGEJO_API_TOKEN=...
+export TAILSCALE_TAILNET=example.ts.net
+export TAILSCALE_OAUTH_CLIENT_ID=...
+export TAILSCALE_OAUTH_CLIENT_SECRET=...
+
+actions-builds-on-railway-sandbox forgejo \
+  --runner-labels railway-ubuntu:host \
+  --job-label-filter railway-ubuntu \
+  --max-runners 10
 ```
 
-Then set the service's variables. At a minimum: a Railway token, `GITHUB_URL`, `SCALE_SET_NAME`, and a GitHub credential (`RAILWAY_ENVIRONMENT_ID` is auto-injected). See [docs/configuration.md](docs/configuration.md) for the full list, and `.env.example` for a starting point.
+The Tailscale OAuth client must be able to create ephemeral, pre-authorized devices with `TAILSCALE_TAG`. Restrict that tag so runner sandboxes can reach only the required Forgejo endpoint.
 
-`.railway/railway.ts` defines the whole project (service, a volume for the dashboard, and the input variables) as Railway Infrastructure-as-Code. Apply it with `bun install && railway config apply`.
+See [docs/configuration.md](docs/configuration.md) and [.env.example](.env.example) for every setting.
+
+## Custom runner images
+
+Both modes support:
+
+- `EXTRA_PACKAGES`: comma/whitespace-separated apt packages.
+- `EXTRA_SETUP`: trusted shell setup baked into the runner image.
+
+Forgejo additionally supports:
+
+- `PRELOAD_DOCKER_IMAGES`: public images pulled into the base checkpoint.
+- `DOCKER_WARMUP_SETUP`: trusted shell setup run with dockerd available.
+- periodic base checkpoint refresh and per-job hydrated checkpoints.
+
+Changing a recipe causes a new template/checkpoint to be prepared. Pin `GITHUB_RUNNER_VERSION` or `FORGEJO_RUNNER_VERSION` for reproducible production images.
 
 ## Dashboard
 
-The service serves a read-only status page on `PORT` (default `8080` locally): live runner counts, jobs over the last 7 days, durations, recent jobs (each linked to its Railway sandbox when `RAILWAY_PROJECT_ID` and `RAILWAY_ENVIRONMENT_ID` are present), and the recent template builds with a per-build detail page at `/builds/<id>` for debugging failures. It records history to SQLite at `$RAILWAY_VOLUME_MOUNT_PATH/dashboard.db` when a Railway volume is attached, falling back to `./data/dashboard.db` for local runs. There is no auth, so put it behind a private network or add one if the domain is public.
+Both modes expose a dashboard on `PORT` (default `8080`) with active runner counts, seven-day usage, recent provider/job/sandbox records, and GitHub template build details. SQLite is stored at `$RAILWAY_VOLUME_MOUNT_PATH/dashboard.db`, falling back to `./data/dashboard.db` locally.
 
-Railway's API does not expose per-line template build logs (the `SandboxTemplateBuild` resource is only a content-addressed id plus a status), so the build detail page shows the resolved runner version, the recipe, status, timing, and any error instead.
+The dashboard has no authentication. Keep it private or put it behind an authenticated proxy.
 
-## Smoke test (Railway transport only, no GitHub)
+## Railway deployment
 
-Checks sandbox create, exec, and destroy against the live API:
+The Docker image defaults to the `github` subcommand. `.railway/railway.ts` defines a GitHub controller service and dashboard volume:
 
 ```bash
-export RAILWAY_API_TOKEN=... RAILWAY_ENVIRONMENT_ID=...
-go run ./cmd/railway-sandbox-actions smoke --command "uname -a"
+bun install
+railway config plan
+railway config apply
+```
+
+A Forgejo controller can use the same image outside Railway, for example from the homenet k3s deployment, with the container argument overridden to `forgejo`.
+
+## Smoke test
+
+Test Railway create/exec/destroy without either Actions provider:
+
+```bash
+actions-builds-on-railway-sandbox smoke --command "uname -a"
+actions-builds-on-railway-sandbox smoke --checkpoint
 ```
 
 ## Tests
 
 ```bash
-go test ./...
+make ci
 ```
 
-The tests cover the GraphQL client (against an in-process server), the `/ws/exec` protocol (against a real WebSocket server), and the scaler state machine (reserve, idle, busy, destroy; the max-runner cap; no over-provisioning). They run offline.
+Tests cover the Railway GraphQL and WebSocket contracts, GitHub scaler state machine, Forgejo API/Tailscale clients, checkpoint creation and scrubbing, duplicate-job suppression, dashboard persistence, and configuration.
 
-## Runner image (prebuilt template)
+## Security
 
-Each runner boots from a prebuilt sandbox template rather than a bare base image. On startup the service builds the template once (`BuildTemplateUntilReady`). Railway content-addresses the build, so every `Sandbox.create` forks the cached image instead of rebuilding.
+- Every job executes as root with dockerd; the Railway sandbox is the isolation boundary.
+- Long-lived provider and Tailscale credentials are never placed in sandbox creation variables or command lines.
+- Job output is not copied into controller logs.
+- Hydrated Forgejo checkpoints remove runner state, workspaces, Docker registry auth, Tailscale state, and temporary files before capture.
+- Docker layers produced by a workflow can still contain secrets. Enable hydrated checkpoints only for trusted workflows.
+- `ENABLE_PRIVATE_NETWORKING` widens sandbox access to Railway private services. Leave it disabled unless required.
+- `EXTRA_SETUP`, `DOCKER_WARMUP_SETUP`, and package lists are trusted operator inputs.
 
-The image (`config.RunnerTemplateInstructions`, Debian/Ubuntu base) contains:
+## Forgejo API assumptions
 
-- a base toolchain: `bash`, `git`, `curl`, `jq`, `make`, `nodejs`, `docker.io`, `unzip`, `xz-utils`, `sudo`, plus the runner's own .NET dependencies (via `installdependencies.sh`);
-- the actions runner (linux-x64, `RUNNER_VERSION` or the latest release), extracted to `/actions-runner`;
-- a start script at `/usr/local/bin/start-runner` that fixes the sandbox's PATH, starts `dockerd` (for `container:`/service jobs and image builds), then runs the runner.
+Forgejo mode currently uses:
 
-Customise the image without forking:
+- `GET /api/v1/admin/actions/runners/jobs`
+- `GET /api/v1/admin/actions/runners/registration-token`
+- `GET /api/v1/repositories/{id}`
+- `GET /api/v1/repos/{owner}/{repo}/actions/tasks`
 
-- `EXTRA_PACKAGES`: extra apt packages, for example `python3,ffmpeg`.
-- `EXTRA_SETUP`: a shell step run last, for example `pip install uv`.
-
-The build is content-addressed, so changing any of these (or the runner version) produces a new cached image on the next start.
-
-## Security notes
-
-- Untrusted job code runs inside the sandbox as root, with dockerd. The sandbox is the isolation boundary; it is created per job and destroyed on completion. `ENABLE_PRIVATE_NETWORKING` widens the blast radius: with it on, a malicious workflow can reach your environment's private services, so enable it only for trusted repos.
-- Pin `RUNNER_VERSION` in production. Left unset it tracks the latest `actions/runner` release; pinning gives reproducible builds. The tarball is fetched over HTTPS from github.com with no separate checksum step, so pinning is your supply-chain control.
-- `EXTRA_SETUP` and `EXTRA_PACKAGES` run as shell at image-build time, so treat them as trusted operator input. `RUNNER_VERSION` and `--runner-workdir` are validated (semver and absolute path) before they reach a shell step.
-- Secrets (Railway tokens, GitHub PAT or App key, the exec JWT, the JIT config) travel in HTTP headers, WebSocket subprotocols, or the exec env frame, never on a command line. Job stdout/stderr is not written to the orchestrator's logs.
+Run one Forgejo controller replica. Duplicate suppression is process-local because Forgejo does not currently provide this controller with a durable queue lease.

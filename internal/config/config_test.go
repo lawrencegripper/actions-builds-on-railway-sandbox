@@ -42,8 +42,8 @@ func allUnset(string) bool { return false }
 
 func TestApplyEnvReadsWhenFlagUnset(t *testing.T) {
 	t.Setenv("GITHUB_URL", "https://github.com/o/r")
-	t.Setenv("MAX_RUNNERS", "9")
-	t.Setenv("RUNNER_LABELS", "a, b ,c")
+	t.Setenv("GITHUB_MAX_RUNNERS", "9")
+	t.Setenv("GITHUB_RUNNER_LABELS", "a, b ,c")
 	t.Setenv("EXTRA_PACKAGES", "python3 ffmpeg")
 	t.Setenv("ENABLE_PRIVATE_NETWORKING", "yes")
 	t.Setenv("GITHUB_APP_INSTALLATION_ID", "42")
@@ -82,9 +82,9 @@ func TestApplyEnvFlagWins(t *testing.T) {
 }
 
 func TestApplyEnvBadInt(t *testing.T) {
-	t.Setenv("MAX_RUNNERS", "notanint")
+	t.Setenv("GITHUB_MAX_RUNNERS", "notanint")
 	if err := (&Config{}).ApplyEnv(allUnset); err == nil {
-		t.Fatal("expected error on non-integer MAX_RUNNERS")
+		t.Fatal("expected error on non-integer GITHUB_MAX_RUNNERS")
 	}
 }
 

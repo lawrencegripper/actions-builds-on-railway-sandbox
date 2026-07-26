@@ -1,4 +1,4 @@
-module github.com/lawrencegripper/railway-sandbox-github-actions-runner
+module github.com/lawrencegripper/actions-builds-on-railway-sandbox
 
 go 1.26.4
 

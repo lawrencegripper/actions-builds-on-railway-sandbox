@@ -4,8 +4,9 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
-    -o /out/railway-sandbox-actions ./cmd/railway-sandbox-actions
+    -o /out/actions-builds-on-railway-sandbox ./cmd/actions-builds-on-railway-sandbox
 
 FROM gcr.io/distroless/static-debian12:nonroot
-COPY --from=build /out/railway-sandbox-actions /usr/local/bin/railway-sandbox-actions
-ENTRYPOINT ["/usr/local/bin/railway-sandbox-actions"]
+COPY --from=build /out/actions-builds-on-railway-sandbox /usr/local/bin/actions-builds-on-railway-sandbox
+ENTRYPOINT ["/usr/local/bin/actions-builds-on-railway-sandbox"]
+CMD ["github"]

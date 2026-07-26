@@ -23,12 +23,16 @@ type Store struct {
 
 const schema = `
 CREATE TABLE IF NOT EXISTS jobs (
-	id          INTEGER PRIMARY KEY AUTOINCREMENT,
-	runner_name TEXT    NOT NULL,
-	started_at  INTEGER NOT NULL,
-	finished_at INTEGER,
-	result      TEXT,
-	sandbox_id  TEXT
+	id              INTEGER PRIMARY KEY AUTOINCREMENT,
+	provider        TEXT    NOT NULL DEFAULT 'github',
+	external_job_id TEXT,
+	job_name        TEXT,
+	repository      TEXT,
+	runner_name     TEXT    NOT NULL,
+	started_at      INTEGER NOT NULL,
+	finished_at     INTEGER,
+	result          TEXT,
+	sandbox_id      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_started_at ON jobs(started_at);
 
@@ -50,6 +54,10 @@ CREATE INDEX IF NOT EXISTS idx_builds_started_at ON template_builds(started_at);
 // tolerated to fail when the column already exists.
 var migrations = []string{
 	`ALTER TABLE jobs ADD COLUMN sandbox_id TEXT`,
+	`ALTER TABLE jobs ADD COLUMN provider TEXT NOT NULL DEFAULT 'github'`,
+	`ALTER TABLE jobs ADD COLUMN external_job_id TEXT`,
+	`ALTER TABLE jobs ADD COLUMN job_name TEXT`,
+	`ALTER TABLE jobs ADD COLUMN repository TEXT`,
 }
 
 // DBPath resolves where the SQLite file lives: on a Railway volume when
@@ -96,7 +104,7 @@ func (s *Store) Close() error { return s.db.Close() }
 // it runs in.
 func (s *Store) JobStarted(runnerName, sandboxID string) {
 	if _, err := s.db.Exec(
-		`INSERT INTO jobs (runner_name, sandbox_id, started_at) VALUES (?, ?, ?)`,
+		`INSERT INTO jobs (provider, runner_name, sandbox_id, started_at) VALUES ('github', ?, ?, ?)`,
 		runnerName, nullable(sandboxID), time.Now().Unix(),
 	); err != nil {
 		s.log.Error("record job started", slog.String("runner", runnerName), slog.String("error", err.Error()))
@@ -119,6 +127,33 @@ func (s *Store) JobCompleted(runnerName, sandboxID, result string) {
 	}
 }
 
+// ProviderJobStarted records a provider-neutral job lifecycle event. It is used
+// by Forgejo mode; GitHub's scale-set sink continues to use JobStarted.
+func (s *Store) ProviderJobStarted(provider, externalJobID, jobName, repository, runnerName, sandboxID string) {
+	if _, err := s.db.Exec(
+		`INSERT INTO jobs (provider, external_job_id, job_name, repository, runner_name, sandbox_id, started_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		provider, nullable(externalJobID), nullable(jobName), nullable(repository), runnerName, nullable(sandboxID), time.Now().Unix(),
+	); err != nil {
+		s.log.Error("record provider job started", slog.String("provider", provider), slog.String("runner", runnerName), slog.String("error", err.Error()))
+	}
+}
+
+func (s *Store) ProviderJobCompleted(provider, externalJobID, runnerName, sandboxID, result string) {
+	if _, err := s.db.Exec(
+		`UPDATE jobs SET finished_at = ?, result = ?, sandbox_id = COALESCE(sandbox_id, ?)
+		 WHERE id = (
+			SELECT id FROM jobs
+			WHERE provider = ? AND runner_name = ? AND finished_at IS NULL
+			  AND (external_job_id = ? OR ? = '')
+			ORDER BY started_at DESC LIMIT 1
+		 )`,
+		time.Now().Unix(), result, nullable(sandboxID), provider, runnerName, externalJobID, externalJobID,
+	); err != nil {
+		s.log.Error("record provider job completed", slog.String("provider", provider), slog.String("runner", runnerName), slog.String("error", err.Error()))
+	}
+}
+
 func nullable(s string) any {
 	if s == "" {
 		return nil
@@ -134,12 +169,16 @@ type DayCount struct {
 
 // RecentJob is one row of the recent-jobs list.
 type RecentJob struct {
-	RunnerName string
-	SandboxID  string
-	Started    time.Time
-	Duration   time.Duration
-	Running    bool
-	Result     string
+	Provider      string
+	ExternalJobID string
+	JobName       string
+	Repository    string
+	RunnerName    string
+	SandboxID     string
+	Started       time.Time
+	Duration      time.Duration
+	Running       bool
+	Result        string
 }
 
 // Usage is the 7-day rollup shown on the page.
@@ -217,7 +256,7 @@ func (s *Store) Usage(now time.Time) (Usage, error) {
 
 func (s *Store) recent(now time.Time, limit int) ([]RecentJob, error) {
 	rows, err := s.db.Query(
-		`SELECT runner_name, sandbox_id, started_at, finished_at, result
+		`SELECT provider, external_job_id, job_name, repository, runner_name, sandbox_id, started_at, finished_at, result
 		 FROM jobs ORDER BY started_at DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
@@ -225,19 +264,22 @@ func (s *Store) recent(now time.Time, limit int) ([]RecentJob, error) {
 	defer rows.Close()
 	var out []RecentJob
 	for rows.Next() {
+		var provider, externalID, jobName, repository, sandbox, result sql.NullString
 		var name string
-		var sandbox sql.NullString
 		var started int64
 		var finished sql.NullInt64
-		var result sql.NullString
-		if err := rows.Scan(&name, &sandbox, &started, &finished, &result); err != nil {
+		if err := rows.Scan(&provider, &externalID, &jobName, &repository, &name, &sandbox, &started, &finished, &result); err != nil {
 			return nil, err
 		}
 		j := RecentJob{
-			RunnerName: name,
-			SandboxID:  sandbox.String,
-			Started:    time.Unix(started, 0).In(now.Location()),
-			Result:     result.String,
+			Provider:      provider.String,
+			ExternalJobID: externalID.String,
+			JobName:       jobName.String,
+			Repository:    repository.String,
+			RunnerName:    name,
+			SandboxID:     sandbox.String,
+			Started:       time.Unix(started, 0).In(now.Location()),
+			Result:        result.String,
 		}
 		if finished.Valid {
 			j.Duration = time.Duration(finished.Int64-started) * time.Second

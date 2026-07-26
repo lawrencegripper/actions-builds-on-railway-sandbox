@@ -6,7 +6,7 @@ setup:
 	@command -v bun >/dev/null 2>&1 && bun install || echo "bun not found; skipping IaC deps (only needed for 'railway config apply')"
 
 fmt:
-	gofmt -w .
+	gofmt -w $$(find . -name '*.go' -not -path './.git/*')
 
 # gofmt check + go vet, no external tools.
 lint:

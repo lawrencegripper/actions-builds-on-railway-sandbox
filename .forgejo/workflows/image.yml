@@ -1,0 +1,20 @@
+name: Container image
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: railway-ubuntu
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to the Forgejo registry
+        run: docker login forgejo.unicorn-tailor.ts.net -u "${{ secrets.FORGEJO_REGISTRY_USER }}" -p "${{ secrets.FORGEJO_REGISTRY_TOKEN }}"
+      - name: Build and publish
+        run: |
+          image=forgejo.unicorn-tailor.ts.net/lawrencegripper/actions-builds-on-railway-sandbox
+          docker build -t "$image:${{ github.sha }}" -t "$image:latest" .
+          docker push "$image:${{ github.sha }}"
+          docker push "$image:latest"

@@ -18,7 +18,7 @@ import (
 
 	"github.com/actions/scaleset"
 
-	"github.com/lawrencegripper/railway-sandbox-github-actions-runner/internal/railway"
+	"github.com/lawrencegripper/actions-builds-on-railway-sandbox/internal/railway"
 )
 
 const (
@@ -104,6 +104,9 @@ func (c *Config) Defaults() {
 // entirely by Railway variables. Explicit flags win over env. Pass a predicate
 // that always returns false to read purely from env (e.g. contexts with no flags).
 func (c *Config) ApplyEnv(changed func(flag string) bool) error {
+	if err := c.ApplyRailwayEnv(changed); err != nil {
+		return err
+	}
 	str := func(flag, env string, dst *string) {
 		if !changed(flag) {
 			if v, ok := os.LookupEnv(env); ok {
@@ -112,33 +115,22 @@ func (c *Config) ApplyEnv(changed func(flag string) bool) error {
 		}
 	}
 	str("url", "GITHUB_URL", &c.RegistrationURL)
-	str("name", "SCALE_SET_NAME", &c.ScaleSetName)
-	str("runner-group", "RUNNER_GROUP", &c.RunnerGroup)
+	str("name", "GITHUB_SCALE_SET_NAME", &c.ScaleSetName)
+	str("runner-group", "GITHUB_RUNNER_GROUP", &c.RunnerGroup)
 	str("token", "GITHUB_TOKEN", &c.Token)
 	str("app-client-id", "GITHUB_APP_CLIENT_ID", &c.GitHubApp.ClientID)
 	str("app-private-key", "GITHUB_APP_PRIVATE_KEY", &c.GitHubApp.PrivateKey)
-	str("runner-version", "RUNNER_VERSION", &c.RunnerVersion)
+	str("runner-version", "GITHUB_RUNNER_VERSION", &c.RunnerVersion)
 	str("extra-setup", "EXTRA_SETUP", &c.ExtraSetup)
-	str("log-level", "LOG_LEVEL", &c.LogLevel)
-	str("log-format", "LOG_FORMAT", &c.LogFormat)
-	str("railway-token", "RAILWAY_API_TOKEN", &c.RailwayToken)
-	str("railway-project-token", "RAILWAY_PROJECT_TOKEN", &c.RailwayProjectToken)
-	str("railway-environment-id", "RAILWAY_ENVIRONMENT_ID", &c.RailwayEnvironmentID)
-	str("railway-endpoint", "RAILWAY_GRAPHQL_ENDPOINT", &c.RailwayEndpoint)
 
 	if !changed("labels") {
-		if v, ok := os.LookupEnv("RUNNER_LABELS"); ok && v != "" {
+		if v, ok := os.LookupEnv("GITHUB_RUNNER_LABELS"); ok && v != "" {
 			c.Labels = splitList(v)
 		}
 	}
 	if !changed("extra-packages") {
 		if v, ok := os.LookupEnv("EXTRA_PACKAGES"); ok && v != "" {
 			c.ExtraPackages = splitList(v)
-		}
-	}
-	if !changed("enable-private-networking") {
-		if v, ok := os.LookupEnv("ENABLE_PRIVATE_NETWORKING"); ok {
-			c.EnablePrivateNetworking = truthy(v)
 		}
 	}
 	if !changed("app-installation-id") {
@@ -150,11 +142,31 @@ func (c *Config) ApplyEnv(changed func(flag string) bool) error {
 			c.GitHubApp.InstallationID = n
 		}
 	}
-	if err := intEnv(changed, "min-runners", "MIN_RUNNERS", &c.MinRunners); err != nil {
+	if err := intEnv(changed, "min-runners", "GITHUB_MIN_RUNNERS", &c.MinRunners); err != nil {
 		return err
 	}
-	if err := intEnv(changed, "max-runners", "MAX_RUNNERS", &c.MaxRunners); err != nil {
-		return err
+	return intEnv(changed, "max-runners", "GITHUB_MAX_RUNNERS", &c.MaxRunners)
+}
+
+// ApplyRailwayEnv applies settings shared by all providers.
+func (c *Config) ApplyRailwayEnv(changed func(flag string) bool) error {
+	str := func(flag, env string, dst *string) {
+		if !changed(flag) {
+			if v, ok := os.LookupEnv(env); ok {
+				*dst = v
+			}
+		}
+	}
+	str("log-level", "LOG_LEVEL", &c.LogLevel)
+	str("log-format", "LOG_FORMAT", &c.LogFormat)
+	str("railway-token", "RAILWAY_API_TOKEN", &c.RailwayToken)
+	str("railway-project-token", "RAILWAY_PROJECT_TOKEN", &c.RailwayProjectToken)
+	str("railway-environment-id", "RAILWAY_ENVIRONMENT_ID", &c.RailwayEnvironmentID)
+	str("railway-endpoint", "RAILWAY_GRAPHQL_ENDPOINT", &c.RailwayEndpoint)
+	if !changed("enable-private-networking") {
+		if v, ok := os.LookupEnv("ENABLE_PRIVATE_NETWORKING"); ok {
+			c.EnablePrivateNetworking = truthy(v)
+		}
 	}
 	return intEnv(changed, "idle-timeout-minutes", "IDLE_TIMEOUT_MINUTES", &c.IdleTimeoutMinutes)
 }
@@ -190,6 +202,9 @@ func truthy(v string) bool {
 
 func (c *Config) Validate() error {
 	c.Defaults()
+	if err := c.ValidateRailway(); err != nil {
+		return err
+	}
 
 	if _, err := url.ParseRequestURI(c.RegistrationURL); err != nil {
 		return fmt.Errorf("invalid --url: %w (e.g. https://github.com/org/repo)", err)
@@ -207,14 +222,19 @@ func (c *Config) Validate() error {
 	if c.MaxRunners < c.MinRunners {
 		return fmt.Errorf("--max-runners cannot be less than --min-runners")
 	}
+	if !runnerWorkdirRe.MatchString(c.RunnerWorkdir) {
+		return fmt.Errorf("--runner-workdir must be an absolute path of [A-Za-z0-9._/-]: %q", c.RunnerWorkdir)
+	}
+	return nil
+}
+
+// ValidateRailway validates settings required in every provider mode.
+func (c *Config) ValidateRailway() error {
 	if c.RailwayToken == "" && c.RailwayProjectToken == "" {
 		return fmt.Errorf("Railway token required: a project token (RAILWAY_PROJECT_TOKEN) or account token (RAILWAY_API_TOKEN)")
 	}
 	if c.RailwayEnvironmentID == "" {
 		return fmt.Errorf("Railway environment id required (--railway-environment-id or RAILWAY_ENVIRONMENT_ID)")
-	}
-	if !runnerWorkdirRe.MatchString(c.RunnerWorkdir) {
-		return fmt.Errorf("--runner-workdir must be an absolute path of [A-Za-z0-9._/-]: %q", c.RunnerWorkdir)
 	}
 	return nil
 }
@@ -240,8 +260,8 @@ func (c *Config) Logger() *slog.Logger {
 
 func systemInfo(scaleSetID int) scaleset.SystemInfo {
 	return scaleset.SystemInfo{
-		System:     "railway-sandbox-actions",
-		Subsystem:  "railway-sandbox-actions",
+		System:     "actions-builds-on-railway-sandbox",
+		Subsystem:  "actions-builds-on-railway-sandbox",
 		CommitSHA:  "NA",
 		Version:    "0.1.0",
 		ScaleSetID: scaleSetID,
