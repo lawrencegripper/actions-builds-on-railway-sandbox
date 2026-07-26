@@ -5,17 +5,13 @@ on:
     branches: [main]
   workflow_dispatch:
 
-permissions:
-  contents: read
-  packages: write
-
 jobs:
   publish:
     runs-on: railway-ubuntu
     steps:
       - uses: actions/checkout@v4
       - name: Log in to the Forgejo registry
-        run: printf '%s' "${{ secrets.FORGEJO_TOKEN }}" | docker login forgejo.unicorn-tailor.ts.net -u "${{ forgejo.actor }}" --password-stdin
+        run: printf '%s' "${{ secrets.FORGEJO_REGISTRY_TOKEN }}" | docker login forgejo.unicorn-tailor.ts.net -u "${{ forgejo.actor }}" --password-stdin
       - name: Build and publish
         run: |
           image=forgejo.unicorn-tailor.ts.net/lawrencegripper/actions-builds-on-railway-sandbox
