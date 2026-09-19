@@ -142,6 +142,7 @@ type graphQLError struct {
 }
 
 func (c *Client) do(ctx context.Context, query string, variables map[string]any, out any) error {
+	operation := graphqlOperation(query)
 	body, err := json.Marshal(graphQLRequest{Query: query, Variables: variables})
 	if err != nil {
 		return err
@@ -173,6 +174,7 @@ func (c *Client) do(ctx context.Context, query string, variables map[string]any,
 		Errors []graphQLError  `json:"errors"`
 	}
 	if err := json.Unmarshal(raw, &envelope); err != nil {
+		c.log.Error("railway graphql response decode failed", slog.String("operation", operation), slog.Int("status", resp.StatusCode), slog.String("response", truncate(raw)), slog.String("error", err.Error()))
 		return fmt.Errorf("railway: decode response (status %d): %w: %s", resp.StatusCode, err, truncate(raw))
 	}
 	if len(envelope.Errors) > 0 {
@@ -180,9 +182,11 @@ func (c *Client) do(ctx context.Context, query string, variables map[string]any,
 		for i, e := range envelope.Errors {
 			msgs[i] = e.Message
 		}
+		c.log.Error("railway graphql error", slog.String("operation", operation), slog.Int("status", resp.StatusCode), slog.String("response", truncate(raw)))
 		return fmt.Errorf("railway: graphql error (status %d): %s", resp.StatusCode, strings.Join(msgs, "; "))
 	}
 	if resp.StatusCode >= 400 {
+		c.log.Error("railway graphql http error", slog.String("operation", operation), slog.Int("status", resp.StatusCode), slog.String("response", truncate(raw)))
 		return fmt.Errorf("railway: http %d: %s", resp.StatusCode, truncate(raw))
 	}
 	if out != nil {
@@ -191,6 +195,16 @@ func (c *Client) do(ctx context.Context, query string, variables map[string]any,
 		}
 	}
 	return nil
+}
+
+func graphqlOperation(query string) string {
+	query = strings.TrimSpace(query)
+	for _, prefix := range []string{"query", "mutation", "subscription"} {
+		if strings.HasPrefix(query, prefix) {
+			return prefix
+		}
+	}
+	return "unknown"
 }
 
 func truncate(b []byte) string {
@@ -331,7 +345,9 @@ func (c *Client) CreateCheckpoint(ctx context.Context, sandboxID, name string) (
 		Checkpoint Checkpoint `json:"sandboxCheckpointCreate"`
 	}
 	vars := map[string]any{"environmentId": c.cfg.EnvironmentID, "name": name, "sandboxId": sandboxID}
+	c.log.Info("creating sandbox checkpoint", slog.String("sandbox", sandboxID), slog.String("checkpoint", name))
 	if err := c.do(ctx, query, vars, &data); err != nil {
+		c.log.Error("sandbox checkpoint creation failed", slog.String("sandbox", sandboxID), slog.String("checkpoint", name), slog.String("error", err.Error()))
 		return nil, err
 	}
 	c.log.Info("sandbox checkpoint created", slog.String("sandbox", sandboxID), slog.String("checkpoint", name), slog.String("id", data.Checkpoint.ID))
