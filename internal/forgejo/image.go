@@ -110,6 +110,7 @@ type RunnerImage struct {
 	Version     string
 	RefreshedAt time.Time
 	Kind        string
+	generation  uint64
 }
 
 type ImageManager struct {
@@ -189,23 +190,8 @@ func (m *ImageManager) PrepareBase(ctx context.Context) (RunnerImage, error) {
 		}
 	}()
 
-	packages := uniqueStrings(append(append([]string{}, basePackages...), m.cfg.ExtraPackages...))
-	steps := []struct{ name, command string }{
-		{"install packages", aptInstallScript(packages)},
-		{"install Tailscale", "set -eux\ncurl -fsSL https://tailscale.com/install.sh | sh"},
-		{"install Forgejo runner", installRunnerScript(version)},
-	}
-	if len(m.cfg.PreloadDockerImages) > 0 || m.cfg.DockerWarmupSetup != "" {
-		steps = append(steps, struct{ name, command string }{"warm Docker cache", dockerWarmupScript(m.cfg.PreloadDockerImages, m.cfg.DockerWarmupSetup)})
-	}
-	if m.cfg.ExtraSetup != "" {
-		steps = append(steps, struct{ name, command string }{"extra setup", m.cfg.ExtraSetup})
-	}
-	steps = append(steps, struct{ name, command string }{"write runner start script", writeFileScript("/usr/local/bin/start-forgejo-runner", forgejoRunnerStartScript)})
-	for _, step := range steps {
-		if err := m.execChecked(ctx, builder.ID, step.name, step.command); err != nil {
-			return RunnerImage{}, err
-		}
+	if err := m.prepareSandbox(ctx, builder.ID, version, true); err != nil {
+		return RunnerImage{}, err
 	}
 	checkpoint, err := m.railway.CreateCheckpoint(ctx, builder.ID, name)
 	if err != nil {
@@ -216,6 +202,38 @@ func (m *ImageManager) PrepareBase(ctx context.Context) (RunnerImage, error) {
 		m.logger.Warn("clean old base checkpoints", "error", err)
 	}
 	return image, nil
+}
+
+func (m *ImageManager) PrepareSandbox(ctx context.Context, sandboxID, version string) error {
+	if err := m.cfg.validateRestricted(); err != nil {
+		return err
+	}
+	if !versionPattern.MatchString(version) || (m.cfg.RestrictedPolicy != nil && version != "13.2.1") {
+		return fmt.Errorf("invalid cold runner version %q", version)
+	}
+	return m.prepareSandbox(ctx, sandboxID, version, false)
+}
+
+func (m *ImageManager) prepareSandbox(ctx context.Context, sandboxID, version string, warm bool) error {
+	packages := uniqueStrings(append(append([]string{}, basePackages...), m.cfg.ExtraPackages...))
+	steps := []struct{ name, command string }{
+		{"install packages", aptInstallScript(packages)},
+		{"install Tailscale", "set -eux\ncurl -fsSL https://tailscale.com/install.sh | sh"},
+		{"install Forgejo runner", installRunnerScript(version)},
+	}
+	if warm && (len(m.cfg.PreloadDockerImages) > 0 || m.cfg.DockerWarmupSetup != "") {
+		steps = append(steps, struct{ name, command string }{"warm Docker cache", dockerWarmupScript(m.cfg.PreloadDockerImages, m.cfg.DockerWarmupSetup)})
+	}
+	if m.cfg.ExtraSetup != "" {
+		steps = append(steps, struct{ name, command string }{"extra setup", m.cfg.ExtraSetup})
+	}
+	steps = append(steps, struct{ name, command string }{"write runner start script", writeFileScript("/usr/local/bin/start-forgejo-runner", forgejoRunnerStartScript)})
+	for _, step := range steps {
+		if err := m.execChecked(ctx, sandboxID, step.name, step.command); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (m *ImageManager) Hydrate(ctx context.Context, sandboxID string, base RunnerImage, snapshotKey string) (RunnerImage, error) {

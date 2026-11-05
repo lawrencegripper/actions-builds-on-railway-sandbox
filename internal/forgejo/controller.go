@@ -23,6 +23,8 @@ type AuthKeyIssuer interface {
 }
 
 type ImageService interface {
+	ResolveVersion(context.Context) (string, error)
+	PrepareSandbox(context.Context, string, string) error
 	PrepareBase(context.Context) (RunnerImage, error)
 	Hydrate(context.Context, string, RunnerImage, string) (RunnerImage, error)
 }
@@ -52,6 +54,8 @@ type Controller struct {
 	activeJobIDs map[string]bool
 	jobImages    map[string]RunnerImage
 	sequence     uint64
+	generation   uint64
+	snapshotMu   sync.Mutex
 	wg           sync.WaitGroup
 }
 
@@ -69,42 +73,67 @@ func NewController(cfg Config, api ForgejoService, keys AuthKeyIssuer, images Im
 	}
 }
 
-// Run builds the base checkpoint, polls Forgejo until ctx is cancelled, and
-// waits for active one-job runners to clean up before returning.
 func (c *Controller) Run(ctx context.Context) error {
 	if err := c.cfg.validateRestricted(); err != nil {
 		return err
 	}
-	base, err := c.images.PrepareBase(ctx)
+	version, err := c.images.ResolveVersion(ctx)
 	if err != nil {
-		return fmt.Errorf("prepare Forgejo runner image: %w", err)
+		return fmt.Errorf("resolve Forgejo runner version: %w", err)
 	}
-	c.logger.Info("Forgejo runner controller ready", "checkpoint", base.Name, "version", base.Version)
-
+	base := RunnerImage{Version: version, Kind: "base", RefreshedAt: time.Now()}
+	c.logger.Info("Forgejo runner controller ready", "version", version, "coldFallback", true)
+	type refreshResult struct {
+		image RunnerImage
+		err   error
+	}
+	prepared := make(chan refreshResult, 1)
+	refreshing := false
+	nextRefresh := time.Now()
 	ticker := time.NewTicker(c.cfg.PollInterval)
 	defer ticker.Stop()
-	for {
-		if time.Since(base.RefreshedAt) >= c.cfg.SnapshotRefresh {
-			refreshed, refreshErr := c.images.PrepareBase(ctx)
-			if refreshErr != nil {
-				c.logger.Error("refresh Forgejo runner image", "error", refreshErr)
-			} else {
-				base = refreshed
-				c.mu.Lock()
-				c.jobImages = make(map[string]RunnerImage)
-				c.mu.Unlock()
-			}
+	defer c.wg.Wait()
+	for ctx.Err() == nil {
+		if !refreshing && !time.Now().Before(nextRefresh) && c.snapshotMu.TryLock() {
+			refreshing = true
+			c.wg.Add(1)
+			go func() {
+				defer c.wg.Done()
+				defer c.snapshotMu.Unlock()
+				buildCtx, cancel := context.WithTimeout(ctx, c.cfg.SnapshotBuildTimeout)
+				defer cancel()
+				image, err := c.images.PrepareBase(buildCtx)
+				select {
+				case prepared <- refreshResult{image, err}:
+				case <-ctx.Done():
+				}
+			}()
 		}
 		if err := c.poll(ctx, base); err != nil && ctx.Err() == nil {
 			c.logger.Error("poll Forgejo jobs", "error", err)
 		}
 		select {
 		case <-ctx.Done():
-			c.wg.Wait()
 			return nil
+		case result := <-prepared:
+			refreshing = false
+			if result.err != nil {
+				c.logger.Warn("base snapshot unavailable; continuing with existing checkpoint or cold runners", "error", result.err)
+				nextRefresh = time.Now().Add(min(5*time.Minute, c.cfg.SnapshotRefresh))
+			} else {
+				base = result.image
+				c.mu.Lock()
+				c.generation++
+				base.generation = c.generation
+				c.jobImages = make(map[string]RunnerImage)
+				c.mu.Unlock()
+				nextRefresh = time.Now().Add(c.cfg.SnapshotRefresh)
+				c.logger.Info("base snapshot ready", "checkpoint", base.Name, "version", base.Version)
+			}
 		case <-ticker.C:
 		}
 	}
+	return nil
 }
 
 func (c *Controller) poll(ctx context.Context, base RunnerImage) error {
@@ -131,8 +160,8 @@ func (c *Controller) poll(ctx context.Context, base RunnerImage) error {
 		if len(launch) >= launchLimit {
 			break
 		}
-		if !c.activeJobIDs[job.Key()] {
-			c.activeJobIDs[job.Key()] = true
+		if _, active := c.activeJobIDs[job.Key()]; !active {
+			c.activeJobIDs[job.Key()] = false
 			c.counts.Provisioning++
 			launch = append(launch, job)
 		}
@@ -155,61 +184,74 @@ func (c *Controller) poll(ctx context.Context, base RunnerImage) error {
 		go func(job Job, sequence uint64, snapshotKey string, image RunnerImage) {
 			defer c.wg.Done()
 			defer c.release(job.Key())
-			if hydrated, ok := c.runOne(ctx, job, sequence, snapshotKey, image); ok {
-				c.mu.Lock()
-				c.jobImages[snapshotKey] = hydrated
-				c.mu.Unlock()
-			}
+			c.runOne(ctx, job, sequence, snapshotKey, image)
 		}(job, sequence, key, image)
 	}
 	return nil
 }
 
-func (c *Controller) runOne(ctx context.Context, job Job, sequence uint64, snapshotKey string, image RunnerImage) (RunnerImage, bool) {
+func (c *Controller) runOne(ctx context.Context, job Job, sequence uint64, snapshotKey string, image RunnerImage) {
 	runnerName := fmt.Sprintf("railway-forgejo-%d-%d", time.Now().Unix(), sequence)
 	started := time.Now()
 	if c.cfg.RestrictedPolicy != nil {
 		if image.Kind != "base" || image.Version != "13.2.1" {
-			c.logger.Error("restricted runner requires a trusted base checkpoint", "jobId", job.ID)
-			return RunnerImage{}, false
+			c.logger.Error("restricted runner requires a clean pinned base", "jobId", job.ID)
+			return
 		}
 		if err := c.authorize(ctx, job); err != nil {
 			c.logger.Warn("reject restricted Forgejo job", "jobId", job.ID, "error", err)
-			return RunnerImage{}, false
+			return
+		}
+	}
+	options := railway.CreateOptions{
+		CheckpointName:     image.Name,
+		IdleTimeoutMinutes: c.cfg.SandboxIdleTimeoutMinutes,
+		NetworkIsolation:   c.network,
+	}
+	sandbox, err := c.railway.CreateSandbox(ctx, options)
+	if err != nil && image.Name != "" && ctx.Err() == nil {
+		c.logger.Warn("restore checkpoint failed; starting cold runner", "checkpoint", image.Name, "error", err)
+		options.CheckpointName = ""
+		sandbox, err = c.railway.CreateSandbox(ctx, options)
+	}
+	if err != nil {
+		c.logger.Error("create Forgejo runner sandbox", "runner", runnerName, "error", err)
+		return
+	}
+	destroy := true
+	defer func() {
+		if destroy {
+			c.destroySandbox(ctx, sandbox.ID)
+		}
+	}()
+	if options.CheckpointName == "" {
+		c.logger.Info("preparing cold runner", "jobId", job.ID, "sandbox", sandbox.ID)
+		setupCtx, cancel := context.WithTimeout(ctx, c.cfg.SnapshotBuildTimeout)
+		err = c.images.PrepareSandbox(setupCtx, sandbox.ID, image.Version)
+		cancel()
+		if err != nil {
+			c.logger.Error("prepare cold runner", "jobId", job.ID, "error", err)
+			return
+		}
+	}
+
+	if c.cfg.RestrictedPolicy != nil {
+		if err := c.authorize(ctx, job); err != nil {
+			c.logger.Warn("restricted Forgejo authorization changed before launch", "jobId", job.ID, "error", err)
+			return
 		}
 	}
 	tailscaleKey, err := c.keys.AuthKey(ctx)
 	if err != nil {
 		c.logger.Error("mint Tailscale auth key", "runner", runnerName, "error", err)
-		return RunnerImage{}, false
+		return
 	}
 	registrationToken, err := c.api.RegistrationToken(ctx)
 	if err != nil {
 		c.logger.Error("mint Forgejo registration token", "runner", runnerName, "error", err)
-		return RunnerImage{}, false
+		return
 	}
-	sandbox, err := c.railway.CreateSandbox(ctx, railway.CreateOptions{
-		CheckpointName:     image.Name,
-		IdleTimeoutMinutes: c.cfg.SandboxIdleTimeoutMinutes,
-		NetworkIsolation:   c.network,
-	})
-	if err != nil {
-		c.logger.Error("create Forgejo runner sandbox", "runner", runnerName, "checkpoint", image.Name, "error", err)
-		return RunnerImage{}, false
-	}
-	c.markRunning()
-	defer func() {
-		if err := c.railway.DestroySandbox(context.WithoutCancel(ctx), sandbox.ID); err != nil {
-			c.logger.Error("destroy Forgejo runner sandbox", "runner", runnerName, "sandbox", sandbox.ID, "error", err)
-		}
-	}()
-
-	if c.cfg.RestrictedPolicy != nil {
-		if err := c.authorize(ctx, job); err != nil {
-			c.logger.Warn("restricted Forgejo authorization changed before launch", "jobId", job.ID, "error", err)
-			return RunnerImage{}, false
-		}
-	}
+	c.markRunning(job.Key())
 
 	externalID := strconv.FormatInt(job.ID, 10)
 	c.sink.ProviderJobStarted("forgejo", externalID, job.Name, strconv.FormatInt(job.RepoID, 10), runnerName, sandbox.ID)
@@ -238,33 +280,53 @@ func (c *Controller) runOne(ctx context.Context, job Job, sequence uint64, snaps
 		}
 		c.sink.ProviderJobCompleted("forgejo", externalID, runnerName, sandbox.ID, outcome)
 		c.logger.Error("Forgejo runner exec", "runner", runnerName, "sandbox", sandbox.ID, "error", execErr)
-		return RunnerImage{}, false
+		return
 	}
-	c.logger.Info("Forgejo runner finished", "runner", runnerName, "sandbox", sandbox.ID, "exitCode", result.ExitCode)
+	c.logger.Info("Forgejo runner finished", "jobId", job.ID, "runner", runnerName, "sandbox", sandbox.ID, "exitCode", result.ExitCode, "reason", result.Reason)
 	if result.ExitCode != 0 {
 		c.sink.ProviderJobCompleted("forgejo", externalID, runnerName, sandbox.ID, "failed")
-		return RunnerImage{}, false
+		return
 	}
 
 	completion, err := c.api.Completion(context.WithoutCancel(ctx), job, started)
 	if err != nil {
 		c.logger.Warn("match Forgejo job completion", "jobId", job.ID, "error", err)
 		c.sink.ProviderJobCompleted("forgejo", externalID, runnerName, sandbox.ID, "unknown")
-		return RunnerImage{}, false
+		return
 	}
 	c.sink.ProviderJobCompleted("forgejo", externalID, runnerName, sandbox.ID, completion.Outcome)
-	if !completion.Hydrate || c.cfg.RestrictedPolicy != nil {
-		return RunnerImage{}, false
+	if !completion.Hydrate || c.cfg.RestrictedPolicy != nil || ctx.Err() != nil || !c.snapshotMu.TryLock() {
+		return
 	}
-	hydrateCtx, hydrateCancel := context.WithTimeout(context.WithoutCancel(ctx), c.cfg.SnapshotBuildTimeout)
-	defer hydrateCancel()
-	hydrated, err := c.images.Hydrate(hydrateCtx, sandbox.ID, image, snapshotKey)
-	if err != nil {
-		c.logger.Error("hydrate Forgejo runner checkpoint", "jobId", job.ID, "sandbox", sandbox.ID, "error", err)
-		return RunnerImage{}, false
+	destroy = false
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		defer c.snapshotMu.Unlock()
+		defer c.destroySandbox(ctx, sandbox.ID)
+		hydrateCtx, cancel := context.WithTimeout(ctx, c.cfg.SnapshotBuildTimeout)
+		defer cancel()
+		hydrated, err := c.images.Hydrate(hydrateCtx, sandbox.ID, image, snapshotKey)
+		if err != nil {
+			c.logger.Warn("optional job snapshot failed", "jobId", job.ID, "sandbox", sandbox.ID, "error", err)
+			return
+		}
+		c.mu.Lock()
+		if image.generation == c.generation {
+			hydrated.generation = image.generation
+			c.jobImages[snapshotKey] = hydrated
+		}
+		c.mu.Unlock()
+		c.logger.Info("hydrated Forgejo runner checkpoint", "jobId", job.ID, "checkpoint", hydrated.Name)
+	}()
+}
+
+func (c *Controller) destroySandbox(ctx context.Context, id string) {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+	defer cancel()
+	if err := c.railway.DestroySandbox(cleanupCtx, id); err != nil {
+		c.logger.Error("destroy Forgejo runner sandbox", "sandbox", id, "error", err)
 	}
-	c.logger.Info("hydrated Forgejo runner checkpoint", "jobId", job.ID, "checkpoint", hydrated.Name)
-	return hydrated, true
 }
 
 func (c *Controller) authorize(ctx context.Context, job Job) error {
@@ -280,21 +342,26 @@ func (c *Controller) authorize(ctx context.Context, job Job) error {
 	return api.AuthorizeJob(ctx, job)
 }
 
-func (c *Controller) markRunning() {
+func (c *Controller) markRunning(jobKey string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.counts.Provisioning--
-	c.counts.Busy++
+	if busy, active := c.activeJobIDs[jobKey]; active && !busy {
+		c.activeJobIDs[jobKey] = true
+		c.counts.Provisioning--
+		c.counts.Busy++
+	}
 }
 
 func (c *Controller) release(jobKey string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	delete(c.activeJobIDs, jobKey)
-	if c.counts.Busy > 0 {
-		c.counts.Busy--
-	} else if c.counts.Provisioning > 0 {
-		c.counts.Provisioning--
+	if busy, active := c.activeJobIDs[jobKey]; active {
+		if busy {
+			c.counts.Busy--
+		} else {
+			c.counts.Provisioning--
+		}
+		delete(c.activeJobIDs, jobKey)
 	}
 }
 

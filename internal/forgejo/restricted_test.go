@@ -174,8 +174,9 @@ func TestRestrictedAuthorizationBeforeCredentials(t *testing.T) {
 			if err := json.Unmarshal(raw, &job); err != nil {
 				t.Fatal(err)
 			}
-			_, hydrated := controller.runOne(context.Background(), job, 1, "unused", RunnerImage{Name: "trusted-base", Version: "13.2.1", Kind: "base"})
-			if hydrated {
+			controller.runOne(context.Background(), job, 1, "unused", RunnerImage{Name: "trusted-base", Version: "13.2.1", Kind: "base"})
+			controller.wg.Wait()
+			if len(controller.jobImages) != 0 {
 				t.Fatal("restricted job hydrated a snapshot")
 			}
 			if !tt.allowed {

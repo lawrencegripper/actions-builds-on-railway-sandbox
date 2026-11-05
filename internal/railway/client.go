@@ -142,6 +142,10 @@ type graphQLError struct {
 }
 
 func (c *Client) do(ctx context.Context, query string, variables map[string]any, out any) error {
+	return c.doWithClient(ctx, c.httpClient, query, variables, out)
+}
+
+func (c *Client) doWithClient(ctx context.Context, client *http.Client, query string, variables map[string]any, out any) error {
 	operation := graphqlOperation(query)
 	body, err := json.Marshal(graphQLRequest{Query: query, Variables: variables})
 	if err != nil {
@@ -158,7 +162,7 @@ func (c *Client) do(ctx context.Context, query string, variables map[string]any,
 		req.Header.Set("Authorization", "Bearer "+c.cfg.Token)
 	}
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("railway: request failed: %w", err)
 	}
@@ -340,13 +344,17 @@ const checkpointFields = `id key environmentId createdAt`
 // CreateCheckpoint captures a running sandbox. The backend call is synchronous:
 // the checkpoint is bootable when it returns.
 func (c *Client) CreateCheckpoint(ctx context.Context, sandboxID, name string) (*Checkpoint, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+	client := *c.httpClient
+	client.Timeout = 0
 	query := `mutation($environmentId: String!, $name: String!, $sandboxId: String!){ sandboxCheckpointCreate(environmentId: $environmentId, name: $name, sandboxId: $sandboxId){ ` + checkpointFields + ` } }`
 	var data struct {
 		Checkpoint Checkpoint `json:"sandboxCheckpointCreate"`
 	}
 	vars := map[string]any{"environmentId": c.cfg.EnvironmentID, "name": name, "sandboxId": sandboxID}
 	c.log.Info("creating sandbox checkpoint", slog.String("sandbox", sandboxID), slog.String("checkpoint", name))
-	if err := c.do(ctx, query, vars, &data); err != nil {
+	if err := c.doWithClient(ctx, &client, query, vars, &data); err != nil {
 		c.log.Error("sandbox checkpoint creation failed", slog.String("sandbox", sandboxID), slog.String("checkpoint", name), slog.String("error", err.Error()))
 		return nil, err
 	}

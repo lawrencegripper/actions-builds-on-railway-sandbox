@@ -29,7 +29,9 @@ func (fakeKeys) AuthKey(context.Context) (string, error) { return "tailscale-sho
 
 type fakeImages struct{}
 
-func (fakeImages) PrepareBase(context.Context) (RunnerImage, error) { return RunnerImage{}, nil }
+func (fakeImages) ResolveVersion(context.Context) (string, error)       { return "13.2.1", nil }
+func (fakeImages) PrepareSandbox(context.Context, string, string) error { return nil }
+func (fakeImages) PrepareBase(context.Context) (RunnerImage, error)     { return RunnerImage{}, nil }
 func (fakeImages) Hydrate(context.Context, string, RunnerImage, string) (RunnerImage, error) {
 	return RunnerImage{}, nil
 }
