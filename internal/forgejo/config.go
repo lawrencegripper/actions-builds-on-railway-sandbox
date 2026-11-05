@@ -16,6 +16,7 @@ var versionPattern = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
 // Config contains Forgejo-specific controller, runner image, and Tailscale
 // settings. Railway connection settings are shared in internal/config.
 type Config struct {
+	RestrictedPolicy     *RestrictedPolicy
 	URL                  string
 	APIToken             string
 	JobsURL              string
@@ -118,6 +119,13 @@ func (c *Config) Defaults() {
 // ApplyEnv applies environment values unless the corresponding command-line
 // flag was explicitly set.
 func (c *Config) ApplyEnv(changed func(string) bool) error {
+	if raw, ok := os.LookupEnv("FORGEJO_RESTRICTED_POLICY"); ok {
+		policy, err := parseRestrictedPolicy(raw)
+		if err != nil {
+			return err
+		}
+		c.RestrictedPolicy = policy
+	}
 	str := func(flag, name string, dst *string) {
 		if !changed(flag) {
 			if value, ok := os.LookupEnv(name); ok {
@@ -221,6 +229,9 @@ func (c *Config) ApplyEnv(changed func(string) bool) error {
 
 func (c *Config) Validate() error {
 	c.Defaults()
+	if err := c.validateRestricted(); err != nil {
+		return err
+	}
 	for name, raw := range map[string]string{
 		"FORGEJO_URL":                    c.URL,
 		"FORGEJO_JOBS_URL":               c.JobsURL,

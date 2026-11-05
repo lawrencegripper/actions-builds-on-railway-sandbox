@@ -66,6 +66,12 @@ Flags override environment variables. Run a subcommand with `--help` for flag de
 
 Duration flags use Go duration syntax; the corresponding environment variables are integer seconds/hours as named.
 
+### Restricted Forgejo pools
+
+`FORGEJO_RESTRICTED_POLICY` is an optional environment-only JSON object with exactly `repository`, `ref`, `event`, `workflow`, and `job_name`. It authorizes one exact tuple; `job_name` is a unique display name, not a YAML job key. Unset preserves ordinary behavior; empty or invalid configuration fails startup.
+
+Restricted mode pins Forgejo 17.0.1 and runner 13.2.1, requires `SNAPSHOT_AFTER_DEFAULT_BRANCH_BUILD=false` and a separate `restricted-` snapshot prefix, and rejects endpoint overrides. See [restricted pool configuration and trust contract](restricted-pools.md) for the complete example, matrix metadata limitation, API checks and Tailscale separation.
+
 ### Forgejo checkpoints
 
 | Environment | Flag | Default |

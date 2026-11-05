@@ -26,10 +26,12 @@ const forgejoRunnerStartScript = `#!/usr/bin/env bash
 set -Eeuo pipefail
 export PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/usr/local/sbin}"
 export SHELL="${SHELL:-/bin/bash}"
-: "${TS_AUTHKEY:?TS_AUTHKEY must be set}"
 : "${FORGEJO_URL:?FORGEJO_URL must be set}"
-: "${FORGEJO_RUNNER_REGISTRATION_TOKEN:?FORGEJO_RUNNER_REGISTRATION_TOKEN must be set}"
 : "${FORGEJO_RUNNER_LABELS:?FORGEJO_RUNNER_LABELS must be set}"
+if [[ "${FORGEJO_RUNNER_RESTRICTED:-false}" == "true" ]]; then
+  : "${FORGEJO_JOB_HANDLE:?restricted runner requires an attempt handle}"
+  forgejo-runner --version | grep -Eq '(^|[[:space:]])v?13[.]2[.]1([[:space:]]|$)'
+fi
 RUNNER_NAME="${RUNNER_NAME:-railway-forgejo-$(hostname | cut -c1-16)}"
 
 cleanup() {
@@ -38,14 +40,30 @@ cleanup() {
 }
 trap cleanup EXIT
 
+if [[ "${1:-}" == "--run-job" ]]; then
+  if [[ "${FORGEJO_RUNNER_RESTRICTED:-false}" == "true" ]]; then
+    forgejo-runner one-job --handle "$FORGEJO_JOB_HANDLE"
+  else
+    forgejo-runner one-job
+  fi
+  exit
+fi
+
+unset TS_AUTHKEY FORGEJO_RUNNER_REGISTRATION_TOKEN
+IFS= read -r -d '' TS_AUTHKEY
+IFS= read -r -d '' FORGEJO_RUNNER_REGISTRATION_TOKEN
+exec </dev/null
+: "${TS_AUTHKEY:?TS_AUTHKEY must be set}"
+: "${FORGEJO_RUNNER_REGISTRATION_TOKEN:?FORGEJO_RUNNER_REGISTRATION_TOKEN must be set}"
+
 mkdir -p /var/run/tailscale /workspace
 chmod 0777 /workspace
 if command -v dockerd >/dev/null 2>&1 && ! docker info >/dev/null 2>&1; then
-  dockerd >/tmp/dockerd.log 2>&1 &
+  env -u TS_AUTHKEY -u FORGEJO_RUNNER_REGISTRATION_TOKEN dockerd >/tmp/dockerd.log 2>&1 &
   for _ in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 1; done
 fi
 
-tailscaled --state=mem: >/tmp/tailscaled.log 2>&1 &
+env -u TS_AUTHKEY -u FORGEJO_RUNNER_REGISTRATION_TOKEN tailscaled --state=mem: >/tmp/tailscaled.log 2>&1 &
 TAILSCALED_PID=$!
 for _ in $(seq 1 30); do tailscale status >/dev/null 2>&1 && break; sleep 1; done
 tailscale up --auth-key="$TS_AUTHKEY" --hostname="$RUNNER_NAME" --accept-dns=true --accept-routes=true
@@ -60,7 +78,9 @@ ephemeral_args=()
 [[ "${FORGEJO_RUNNER_EPHEMERAL:-true}" == "true" ]] && ephemeral_args+=(--ephemeral)
 forgejo-runner register --instance "$FORGEJO_URL" --token "$FORGEJO_RUNNER_REGISTRATION_TOKEN" --name "$RUNNER_NAME" --labels "$FORGEJO_RUNNER_LABELS" "${ephemeral_args[@]}" --no-interactive
 unset FORGEJO_RUNNER_REGISTRATION_TOKEN
-forgejo-runner one-job
+export TAILSCALED_PID RUNNER_NAME
+# Replace the bootstrap shell before any workflow code runs.
+exec bash "$0" --run-job
 `
 
 const scrubScript = `set -eux
@@ -147,6 +167,9 @@ func (m *ImageManager) ResolveVersion(ctx context.Context) (string, error) {
 }
 
 func (m *ImageManager) PrepareBase(ctx context.Context) (RunnerImage, error) {
+	if err := m.cfg.validateRestricted(); err != nil {
+		return RunnerImage{}, err
+	}
 	version, err := m.ResolveVersion(ctx)
 	if err != nil {
 		return RunnerImage{}, err
@@ -196,6 +219,9 @@ func (m *ImageManager) PrepareBase(ctx context.Context) (RunnerImage, error) {
 }
 
 func (m *ImageManager) Hydrate(ctx context.Context, sandboxID string, base RunnerImage, snapshotKey string) (RunnerImage, error) {
+	if m.cfg.RestrictedPolicy != nil {
+		return RunnerImage{}, fmt.Errorf("restricted pools cannot capture hydrated checkpoints")
+	}
 	kind := "hydrated-" + sanitizeCheckpointPart(snapshotKey)
 	name := m.checkpointName(base.Version, kind)
 	if err := m.execChecked(ctx, sandboxID, "scrub completed runner", scrubScript); err != nil {

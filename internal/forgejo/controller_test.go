@@ -101,8 +101,11 @@ func TestControllerDeduplicatesQueuedJobAndKeepsSecretsOutOfCreate(t *testing.T)
 	controller.wg.Wait()
 	service.mu.Lock()
 	defer service.mu.Unlock()
-	if len(service.execOptions) != 1 || service.execOptions[0].Env["TS_AUTHKEY"] != "tailscale-short" || service.execOptions[0].Env["FORGEJO_RUNNER_REGISTRATION_TOKEN"] != "registration-short" {
-		t.Fatalf("exec environment = %#v", service.execOptions)
+	if len(service.execOptions) != 1 || string(service.execOptions[0].Stdin) != "tailscale-short\x00registration-short\x00" {
+		t.Fatal("bootstrap credentials not sent through stdin")
+	}
+	if service.execOptions[0].Env["TS_AUTHKEY"] != "" || service.execOptions[0].Env["FORGEJO_RUNNER_REGISTRATION_TOKEN"] != "" {
+		t.Fatal("bootstrap credentials exposed in exec environment")
 	}
 	if len(service.destroyed) != 1 {
 		t.Fatalf("destroyed = %v", service.destroyed)

@@ -147,3 +147,105 @@ func TestExecContextCancel(t *testing.T) {
 		t.Fatal("expected error on context cancel")
 	}
 }
+
+func TestExecBootstrapInputUsesStdinNotInit(t *testing.T) {
+	payload := []byte("bootstrap-secret\x00registration-secret\x00")
+	graphqlURL, wsURL := execTestServer(t, func(t *testing.T, c *websocket.Conn) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		defer c.Close(websocket.StatusNormalClosure, "")
+		_, data, err := c.Read(ctx)
+		if err != nil || string(data) != `{"type":"exec_hello"}` {
+			t.Errorf("stdin must negotiate before init: %s (%v)", data, err)
+			return
+		}
+		_ = c.Write(ctx, websocket.MessageText, []byte(`{"type":"exec_capabilities","data":{"version":2,"stdin_chunks":8,"stdin_chunk_bytes":16384}}`))
+		_, data, err = c.Read(ctx)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if strings.Contains(string(data), "secret") || !strings.Contains(string(data), `"init_exec"`) {
+			t.Errorf("credentials in init or missing init: %s", data)
+		}
+		typ, data, err := c.Read(ctx)
+		if err != nil || typ != websocket.MessageBinary || len(data) == 0 || data[0] != 0x02 || string(data[1:]) != string(payload) {
+			t.Errorf("incorrect stdin frame: type=%v data=%q err=%v", typ, data, err)
+			return
+		}
+		_, data, err = c.Read(ctx)
+		if err != nil || string(data) != `{"type":"stdin_close"}` {
+			t.Errorf("expected EOF: %s (%v)", data, err)
+			return
+		}
+		_ = c.Write(ctx, websocket.MessageText, []byte(`{"type":"exit","data":{"exit_code":0}}`))
+	})
+	options := ExecOptions{Stdin: payload}
+	result, err := clientFor(t, graphqlURL, wsURL).Exec(context.Background(), "sbx", "exec /bootstrap", options)
+	if err != nil || result.ExitCode != 0 {
+		t.Fatalf("stdin exec result=%+v error=%v", result, err)
+	}
+}
+
+func TestExecBootstrapInputRejectsUnsupportedBridge(t *testing.T) {
+	for _, response := range []string{
+		`{"type":"exec_capabilities","data":{"version":1,"stdin_chunks":8,"stdin_chunk_bytes":16384}}`,
+		`{"type":"exec_capabilities","data":{"version":2,"stdin_chunks":0,"stdin_chunk_bytes":16384}}`,
+		`{"type":"exec_capabilities","data":{"version":2,"stdin_chunks":8,"stdin_chunk_bytes":1}}`,
+		`{"type":"error"}`,
+		"close",
+	} {
+		t.Run(response, func(t *testing.T) {
+			graphqlURL, wsURL := execTestServer(t, func(t *testing.T, c *websocket.Conn) {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				defer c.Close(websocket.StatusNormalClosure, "")
+				_, data, err := c.Read(ctx)
+				if err != nil || string(data) != `{"type":"exec_hello"}` {
+					t.Errorf("command sent before capabilities: %s", data)
+					return
+				}
+				if response == "close" {
+					return
+				}
+				_ = c.Write(ctx, websocket.MessageText, []byte(response))
+				if _, data, err := c.Read(ctx); err == nil {
+					t.Errorf("unsupported bridge received command/credentials: %s", data)
+				}
+			})
+			options := ExecOptions{Stdin: []byte("secret")}
+			if _, err := clientFor(t, graphqlURL, wsURL).Exec(context.Background(), "sbx", "exec /bootstrap", options); err == nil {
+				t.Fatal("unsupported stdin bridge accepted")
+			}
+		})
+	}
+}
+
+func TestExecRejectsOversizedBootstrapInputBeforeConnection(t *testing.T) {
+	client := clientFor(t, "http://unused.invalid", "ws://unused.invalid")
+	_, err := client.Exec(context.Background(), "sbx", "exec /bootstrap", ExecOptions{Stdin: make([]byte, maxExecStdinBytes+1)})
+	if err == nil || !strings.Contains(err.Error(), "stdin exceeds") {
+		t.Fatalf("oversized input error = %v", err)
+	}
+}
+
+func TestExecBootstrapInputReportsRemoteStdinFailure(t *testing.T) {
+	graphqlURL, wsURL := execTestServer(t, func(t *testing.T, c *websocket.Conn) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		defer c.Close(websocket.StatusNormalClosure, "")
+		_, _, _ = c.Read(ctx)
+		_ = c.Write(ctx, websocket.MessageText, []byte(`{"type":"exec_capabilities","data":{"version":2,"stdin_chunks":1,"stdin_chunk_bytes":16384}}`))
+		for range 3 {
+			if _, _, err := c.Read(ctx); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+		_ = c.Write(ctx, websocket.MessageText, []byte(`{"type":"stdin_error","data":{"message":"secret from remote"}}`))
+	})
+	_, err := clientFor(t, graphqlURL, wsURL).Exec(context.Background(), "sbx", "exec /bootstrap", ExecOptions{Stdin: []byte("secret")})
+	if err == nil || !strings.Contains(err.Error(), "stdin_error") || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("stdin failure not safely reported: %v", err)
+	}
+}

@@ -72,6 +72,9 @@ func NewController(cfg Config, api ForgejoService, keys AuthKeyIssuer, images Im
 // Run builds the base checkpoint, polls Forgejo until ctx is cancelled, and
 // waits for active one-job runners to clean up before returning.
 func (c *Controller) Run(ctx context.Context) error {
+	if err := c.cfg.validateRestricted(); err != nil {
+		return err
+	}
 	base, err := c.images.PrepareBase(ctx)
 	if err != nil {
 		return fmt.Errorf("prepare Forgejo runner image: %w", err)
@@ -109,6 +112,17 @@ func (c *Controller) poll(ctx context.Context, base RunnerImage) error {
 	if err != nil {
 		return err
 	}
+	if c.cfg.RestrictedPolicy != nil {
+		allowed := make([]Job, 0, len(jobs))
+		for _, job := range jobs {
+			if err := c.authorize(ctx, job); err != nil {
+				c.logger.Warn("reject restricted Forgejo job", "jobId", job.ID, "error", err)
+				continue
+			}
+			allowed = append(allowed, job)
+		}
+		jobs = allowed
+	}
 	c.mu.Lock()
 	capacity := max(0, c.cfg.MaxConcurrentSandboxes-c.counts.Total())
 	launchLimit := min(capacity, c.cfg.MaxLaunchPerPoll)
@@ -133,7 +147,7 @@ func (c *Controller) poll(ctx context.Context, base RunnerImage) error {
 		sequence := c.sequence
 		key := snapshotKey(job)
 		image := c.jobImages[key]
-		if image.Name == "" {
+		if image.Name == "" || c.cfg.RestrictedPolicy != nil {
 			image = base
 		}
 		c.mu.Unlock()
@@ -154,6 +168,16 @@ func (c *Controller) poll(ctx context.Context, base RunnerImage) error {
 func (c *Controller) runOne(ctx context.Context, job Job, sequence uint64, snapshotKey string, image RunnerImage) (RunnerImage, bool) {
 	runnerName := fmt.Sprintf("railway-forgejo-%d-%d", time.Now().Unix(), sequence)
 	started := time.Now()
+	if c.cfg.RestrictedPolicy != nil {
+		if image.Kind != "base" || image.Version != "13.2.1" {
+			c.logger.Error("restricted runner requires a trusted base checkpoint", "jobId", job.ID)
+			return RunnerImage{}, false
+		}
+		if err := c.authorize(ctx, job); err != nil {
+			c.logger.Warn("reject restricted Forgejo job", "jobId", job.ID, "error", err)
+			return RunnerImage{}, false
+		}
+	}
 	tailscaleKey, err := c.keys.AuthKey(ctx)
 	if err != nil {
 		c.logger.Error("mint Tailscale auth key", "runner", runnerName, "error", err)
@@ -180,19 +204,32 @@ func (c *Controller) runOne(ctx context.Context, job Job, sequence uint64, snaps
 		}
 	}()
 
+	if c.cfg.RestrictedPolicy != nil {
+		if err := c.authorize(ctx, job); err != nil {
+			c.logger.Warn("restricted Forgejo authorization changed before launch", "jobId", job.ID, "error", err)
+			return RunnerImage{}, false
+		}
+	}
+
 	externalID := strconv.FormatInt(job.ID, 10)
 	c.sink.ProviderJobStarted("forgejo", externalID, job.Name, strconv.FormatInt(job.RepoID, 10), runnerName, sandbox.ID)
 	runCtx, cancel := context.WithTimeout(ctx, c.cfg.RunnerTimeout)
-	result, execErr := c.railway.Exec(runCtx, sandbox.ID, "/usr/local/bin/start-forgejo-runner", railway.ExecOptions{Env: map[string]string{
-		"TS_AUTHKEY":                        tailscaleKey,
-		"FORGEJO_URL":                       c.cfg.URL,
-		"FORGEJO_RUNNER_REGISTRATION_TOKEN": registrationToken,
-		"FORGEJO_RUNNER_LABELS":             c.cfg.RunnerLabels,
-		"FORGEJO_RUNNER_EPHEMERAL":          "true",
-		"RUNNER_NAME":                       runnerName,
-		"PATH":                              "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/usr/local/sbin",
-		"SHELL":                             "/bin/bash",
-	}})
+	env := map[string]string{
+		"FORGEJO_URL":              c.cfg.URL,
+		"FORGEJO_RUNNER_LABELS":    c.cfg.RunnerLabels,
+		"FORGEJO_RUNNER_EPHEMERAL": "true",
+		"RUNNER_NAME":              runnerName,
+		"PATH":                     "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/usr/local/sbin",
+		"SHELL":                    "/bin/bash",
+	}
+	if c.cfg.RestrictedPolicy != nil {
+		env["FORGEJO_RUNNER_RESTRICTED"] = "true"
+		env["FORGEJO_JOB_HANDLE"] = job.Handle
+	}
+	result, execErr := c.railway.Exec(runCtx, sandbox.ID, "exec /usr/local/bin/start-forgejo-runner", railway.ExecOptions{
+		Env:   env,
+		Stdin: []byte(tailscaleKey + "\x00" + registrationToken + "\x00"),
+	})
 	cancel()
 	if execErr != nil {
 		outcome := "failed"
@@ -216,7 +253,7 @@ func (c *Controller) runOne(ctx context.Context, job Job, sequence uint64, snaps
 		return RunnerImage{}, false
 	}
 	c.sink.ProviderJobCompleted("forgejo", externalID, runnerName, sandbox.ID, completion.Outcome)
-	if !completion.Hydrate {
+	if !completion.Hydrate || c.cfg.RestrictedPolicy != nil {
 		return RunnerImage{}, false
 	}
 	hydrateCtx, hydrateCancel := context.WithTimeout(context.WithoutCancel(ctx), c.cfg.SnapshotBuildTimeout)
@@ -228,6 +265,19 @@ func (c *Controller) runOne(ctx context.Context, job Job, sequence uint64, snaps
 	}
 	c.logger.Info("hydrated Forgejo runner checkpoint", "jobId", job.ID, "checkpoint", hydrated.Name)
 	return hydrated, true
+}
+
+func (c *Controller) authorize(ctx context.Context, job Job) error {
+	if err := c.cfg.validateRestricted(); err != nil {
+		return err
+	}
+	api, ok := c.api.(interface {
+		AuthorizeJob(context.Context, Job) error
+	})
+	if !ok {
+		return fmt.Errorf("Forgejo client does not support restricted job authorization")
+	}
+	return api.AuthorizeJob(ctx, job)
 }
 
 func (c *Controller) markRunning() {

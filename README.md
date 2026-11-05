@@ -18,7 +18,7 @@ GitHub scale-set API ──▶ GitHub controller ──▶ Railway template sand
 
 ### Forgejo
 
-Forgejo mode polls the Forgejo 15+ admin runner-job endpoint. For each waiting job it mints a one-job registration token and an ephemeral Tailscale key, then starts a runner from a Railway checkpoint.
+Forgejo mode polls the Forgejo 15+ admin runner-job endpoint. For each waiting job it obtains a reusable runner registration token and creates an ephemeral Tailscale key, then starts a one-job runner from a Railway checkpoint.
 
 ```text
 Forgejo admin API ──▶ Forgejo controller ──▶ Railway checkpoint sandbox
@@ -56,7 +56,7 @@ GitHub runner images use Railway's content-addressed template builds. The image 
 
 ## Run Forgejo mode
 
-The Forgejo controller needs Railway, Forgejo admin API, and Tailscale OAuth credentials. Long-lived credentials remain in the controller; sandboxes receive only short-lived registration and Tailscale keys through the exec environment.
+The Forgejo controller needs Railway, Forgejo admin API, and Tailscale OAuth credentials. Those API credentials remain in the controller. A reusable runner registration token and the sandbox's ephemeral Tailscale key travel through exec stdin, not its environment. Bootstrap finishes registration and replaces its credential-bearing shell before running a job. The Railway exec bridge must support exec-control v2 stdin; there is no environment fallback.
 
 ```bash
 export RAILWAY_API_TOKEN=...
@@ -74,6 +74,8 @@ actions-builds-on-railway-sandbox forgejo \
 ```
 
 The Tailscale OAuth client must be able to create ephemeral, pre-authorized devices with `TAILSCALE_TAG`. Restrict that tag so runner sandboxes can reach only the required Forgejo endpoint.
+
+For privileged jobs, use a separate [restricted pool](docs/restricted-pools.md). `FORGEJO_RESTRICTED_POLICY` checks an exact repository/full-ref/event/workflow/unique-display-name tuple before provisioning, then binds runner 13.2.1 to that attempt's handle. This requires Forgejo 17.0.1 and base-only snapshots. Labels alone are not authorization.
 
 See [docs/configuration.md](docs/configuration.md) and [.env.example](.env.example) for every setting.
 
@@ -132,7 +134,7 @@ Tests cover the Railway GraphQL and WebSocket contracts, GitHub scaler state mac
 ## Security
 
 - Every job executes as root with dockerd; the Railway sandbox is the isolation boundary.
-- Long-lived provider and Tailscale credentials are never placed in sandbox creation variables or command lines.
+- Controller API credentials never enter the sandbox. Forgejo bootstrap credentials travel via stdin; only transient join/registration processes receive them in arguments, before workflow execution.
 - Job output is not copied into controller logs.
 - Hydrated Forgejo checkpoints remove runner state, workspaces, Docker registry auth, Tailscale state, and temporary files before capture.
 - Docker layers produced by a workflow can still contain secrets. Enable hydrated checkpoints only for trusted workflows.

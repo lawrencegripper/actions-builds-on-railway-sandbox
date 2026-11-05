@@ -15,10 +15,13 @@ import (
 
 // Job is a queued Forgejo Actions runner job returned by the admin API.
 type Job struct {
-	ID     int64  `json:"id"`
-	RepoID int64  `json:"repo_id"`
-	Name   string `json:"name"`
-	Status string `json:"status"`
+	RunID   int64  `json:"run_id"`
+	Attempt int64  `json:"attempt"`
+	Handle  string `json:"handle"`
+	ID      int64  `json:"id"`
+	RepoID  int64  `json:"repo_id"`
+	Name    string `json:"name"`
+	Status  string `json:"status"`
 }
 
 func (j Job) Key() string {
@@ -29,6 +32,8 @@ func (j Job) Key() string {
 }
 
 type Repository struct {
+	ID            int64  `json:"id"`
+	Fork          *bool  `json:"fork"`
 	Name          string `json:"name"`
 	FullName      string `json:"full_name"`
 	DefaultBranch string `json:"default_branch"`
@@ -118,7 +123,11 @@ func (a *API) RegistrationToken(ctx context.Context) (string, error) {
 	var response struct {
 		Token string `json:"token"`
 	}
-	if err := a.getJSON(ctx, a.cfg.RegistrationTokenURL, &response); err != nil {
+	rawURL := a.cfg.RegistrationTokenURL
+	if a.cfg.RestrictedPolicy != nil {
+		rawURL = a.cfg.RestrictedPolicy.repositoryURL(a.cfg.URL) + "/actions/runners/registration-token"
+	}
+	if err := a.getJSON(ctx, rawURL, &response); err != nil {
 		return "", err
 	}
 	if response.Token == "" {
@@ -170,10 +179,11 @@ type JobCompletion struct {
 	Hydrate bool
 }
 
-// Completion finds the task most likely claimed by a completed one-job runner.
-// Forgejo does not expose a direct claim correlation here, so this preserves the
-// existing scaler's best-effort match by recent timestamp and job name.
 func (a *API) Completion(ctx context.Context, job Job, runnerStarted time.Time) (JobCompletion, error) {
+	if a.cfg.RestrictedPolicy != nil {
+		return a.restrictedCompletion(ctx, job)
+	}
+	// Unbound runners retain best-effort completion matching by time and name.
 	if job.RepoID == 0 {
 		return JobCompletion{Outcome: "unknown"}, nil
 	}
