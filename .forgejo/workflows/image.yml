@@ -11,7 +11,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Log in to the Forgejo registry
-        run: printf '%s' "${{ secrets.FORGEJO_REGISTRY_TOKEN }}" | docker login forgejo.unicorn-tailor.ts.net -u "${{ forgejo.actor }}" --password-stdin
+        env:
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          test -n "$REGISTRY_TOKEN" || { echo "Missing REGISTRY_TOKEN secret" >&2; exit 1; }
+          printf '%s' "$REGISTRY_TOKEN" | docker login forgejo.unicorn-tailor.ts.net -u "${{ github.repository_owner }}" --password-stdin
       - name: Build and publish
         run: |
           image=forgejo.unicorn-tailor.ts.net/lawrencegripper/actions-builds-on-railway-sandbox
